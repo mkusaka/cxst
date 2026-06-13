@@ -1,0 +1,4 @@
+interface:
+  display_name: "cxst"
+  short_description: "Check local Codex status with cxst"
+  default_prompt: "Use cxst to check local Codex account and rate-limit status."
