@@ -1,0 +1,38 @@
+[
+  {
+    "limit_id": "codex",
+    "limit_name": null,
+    "primary": {
+      "used_percent": 25.0,
+      "window_minutes": 300,
+      "resets_at": 1700000000
+    },
+    "secondary": {
+      "used_percent": 60.0,
+      "window_minutes": 10080,
+      "resets_at": 1700604800
+    },
+    "credits": null,
+    "individual_limit": null,
+    "plan_type": "pro",
+    "rate_limit_reached_type": null
+  },
+  {
+    "limit_id": "example_additional",
+    "limit_name": "Example additional limit",
+    "primary": {
+      "used_percent": 90.0,
+      "window_minutes": 300,
+      "resets_at": 1700003600
+    },
+    "secondary": {
+      "used_percent": 10.0,
+      "window_minutes": 10080,
+      "resets_at": 1700608400
+    },
+    "credits": null,
+    "individual_limit": null,
+    "plan_type": "pro",
+    "rate_limit_reached_type": null
+  }
+]

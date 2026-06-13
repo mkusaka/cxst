@@ -51,18 +51,26 @@ struct Cli {
 enum Command {
     #[command(about = "Show Codex account and rate-limit status.")]
     Status,
-    #[command(about = "Wait until selected rate-limit remaining usage reaches a threshold.")]
+    #[command(
+        about = "Check whether selected rate-limit remaining usage is above a threshold.",
+        after_long_help = "Exit codes:\n  0  selected rate limits are above the threshold\n  1  threshold reached, or rate-limit status is unavailable"
+    )]
+    Check(CheckArgs),
+    #[command(
+        about = "Wait until selected rate-limit remaining usage reaches a threshold.",
+        after_long_help = "Exit codes:\n  0  timeout reached before the threshold was hit\n  1  threshold reached, or rate-limit status is unavailable"
+    )]
     Wait(WaitArgs),
 }
 
 #[derive(Debug, Args)]
-struct WaitArgs {
+struct CheckArgs {
     #[arg(
         long = "remaining-percent",
         alias = "threshold",
         default_value = "10",
         value_parser = parse_percent_arg,
-        help = "Exit when selected rate limits have this remaining percent or less."
+        help = "Fail when selected rate limits have this remaining percent or less."
     )]
     remaining_percent: f64,
 
@@ -73,6 +81,12 @@ struct WaitArgs {
         help = "Rate-limit window to watch."
     )]
     window: WaitWindow,
+}
+
+#[derive(Debug, Args)]
+struct WaitArgs {
+    #[clap(flatten)]
+    check: CheckArgs,
 
     #[arg(
         short = 'i',
@@ -193,6 +207,12 @@ enum WaitDecision {
     Unavailable(String),
 }
 
+#[derive(Debug, PartialEq)]
+struct CommandOutput {
+    exit_code: u8,
+    stdout: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WaitEventOutput {
@@ -208,6 +228,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Command::Check(args)) => run_check(&cli, args).await,
         Some(Command::Wait(args)) => run_wait(&cli, args).await,
         Some(Command::Status) | None => {
             let output = load_status(&cli).await?;
@@ -262,23 +283,87 @@ async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
     })
 }
 
+async fn run_check(cli: &Cli, args: &CheckArgs) -> anyhow::Result<ExitCode> {
+    let output = load_status(cli).await?;
+    let result = check_rate_limits(&output.rate_limits, args, cli.json)?;
+    print!("{}", result.stdout);
+    Ok(exit_code(result.exit_code))
+}
+
+fn check_rate_limits(
+    rate_limits: &RateLimitsOutput,
+    args: &CheckArgs,
+    json: bool,
+) -> anyhow::Result<CommandOutput> {
+    match evaluate_wait(rate_limits, args.window, args.remaining_percent) {
+        WaitDecision::Triggered(windows) => Ok(CommandOutput {
+            exit_code: 1,
+            stdout: if json {
+                format_wait_json(
+                    "threshold_reached",
+                    args.remaining_percent,
+                    windows,
+                    None,
+                    None,
+                )?
+            } else {
+                format_wait_triggered(args.remaining_percent, &windows)
+            },
+        }),
+        WaitDecision::Unavailable(reason) => Ok(CommandOutput {
+            exit_code: 1,
+            stdout: if json {
+                format_wait_json(
+                    "unavailable",
+                    args.remaining_percent,
+                    Vec::new(),
+                    Some(reason),
+                    None,
+                )?
+            } else {
+                format!("rate limits unavailable: {reason}\n")
+            },
+        }),
+        WaitDecision::Continue(windows) => Ok(CommandOutput {
+            exit_code: 0,
+            stdout: if json {
+                format_wait_json("ok", args.remaining_percent, windows, None, None)?
+            } else {
+                format_check_ok(args.remaining_percent, &windows)
+            },
+        }),
+    }
+}
+
+fn exit_code(code: u8) -> ExitCode {
+    if code == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(code)
+    }
+}
+
 async fn run_wait(cli: &Cli, args: &WaitArgs) -> anyhow::Result<ExitCode> {
     let started = Instant::now();
 
     loop {
         let output = load_status(cli).await?;
-        match evaluate_wait(&output.rate_limits, args.window, args.remaining_percent) {
+        match evaluate_wait(
+            &output.rate_limits,
+            args.check.window,
+            args.check.remaining_percent,
+        ) {
             WaitDecision::Triggered(windows) => {
                 if cli.json {
                     print_wait_json(
                         "threshold_reached",
-                        args.remaining_percent,
+                        args.check.remaining_percent,
                         windows,
                         None,
                         None,
                     )?;
                 } else {
-                    print_wait_triggered(args.remaining_percent, &windows);
+                    print_wait_triggered(args.check.remaining_percent, &windows);
                 }
                 return Ok(ExitCode::from(1));
             }
@@ -286,7 +371,7 @@ async fn run_wait(cli: &Cli, args: &WaitArgs) -> anyhow::Result<ExitCode> {
                 if cli.json {
                     print_wait_json(
                         "unavailable",
-                        args.remaining_percent,
+                        args.check.remaining_percent,
                         Vec::new(),
                         Some(reason),
                         None,
@@ -301,7 +386,13 @@ async fn run_wait(cli: &Cli, args: &WaitArgs) -> anyhow::Result<ExitCode> {
                     && started.elapsed() >= timeout
                 {
                     if cli.json {
-                        print_wait_json("timeout", args.remaining_percent, windows, None, None)?;
+                        print_wait_json(
+                            "timeout",
+                            args.check.remaining_percent,
+                            windows,
+                            None,
+                            None,
+                        )?;
                     } else {
                         println!("threshold not reached within {}", format_duration(timeout));
                     }
@@ -312,13 +403,13 @@ async fn run_wait(cli: &Cli, args: &WaitArgs) -> anyhow::Result<ExitCode> {
                 if cli.json {
                     print_wait_json(
                         "waiting",
-                        args.remaining_percent,
+                        args.check.remaining_percent,
                         windows,
                         None,
                         Some(sleep_for.as_secs()),
                     )?;
                 } else {
-                    print_wait_continue(args.remaining_percent, &windows, sleep_for);
+                    print_wait_continue(args.check.remaining_percent, &windows, sleep_for);
                 }
                 tokio::time::sleep(sleep_for).await;
             }
@@ -883,17 +974,39 @@ fn print_limit_window(label: &str, window: Option<&RateLimitWindowOutput>) {
     }
 }
 
+fn format_check_ok(threshold: f64, windows: &[WaitObservedWindow]) -> String {
+    if let Some(lowest) = lowest_remaining_window(windows) {
+        format!(
+            "rate limit check ok: lowest selected limit is {} {} limit {:.0}% left > {:.0}%{}",
+            lowest.scope,
+            lowest.window,
+            lowest.remaining_percent,
+            threshold,
+            wait_reset_suffix(lowest)
+        ) + "\n"
+    } else {
+        String::new()
+    }
+}
+
 fn print_wait_triggered(threshold: f64, windows: &[WaitObservedWindow]) {
+    print!("{}", format_wait_triggered(threshold, windows));
+}
+
+fn format_wait_triggered(threshold: f64, windows: &[WaitObservedWindow]) -> String {
+    let mut output = String::new();
     for window in windows {
-        println!(
+        output.push_str(&format!(
             "rate limit threshold reached: {} {} limit {:.0}% left <= {:.0}%{}",
             window.scope,
             window.window,
             window.remaining_percent,
             threshold,
             wait_reset_suffix(window)
-        );
+        ));
+        output.push('\n');
     }
+    output
 }
 
 fn print_wait_continue(threshold: f64, windows: &[WaitObservedWindow], sleep_for: Duration) {
@@ -917,6 +1030,20 @@ fn print_wait_json(
     reason: Option<String>,
     next_poll_seconds: Option<u64>,
 ) -> anyhow::Result<()> {
+    print!(
+        "{}",
+        format_wait_json(status, threshold, windows, reason, next_poll_seconds)?
+    );
+    Ok(())
+}
+
+fn format_wait_json(
+    status: &str,
+    threshold: f64,
+    windows: Vec<WaitObservedWindow>,
+    reason: Option<String>,
+    next_poll_seconds: Option<u64>,
+) -> anyhow::Result<String> {
     let output = WaitEventOutput {
         status: status.to_string(),
         threshold_remaining_percent: threshold,
@@ -924,8 +1051,7 @@ fn print_wait_json(
         reason,
         next_poll_seconds,
     };
-    println!("{}", serde_json::to_string(&output)?);
-    Ok(())
+    Ok(format!("{}\n", serde_json::to_string(&output)?))
 }
 
 fn lowest_remaining_window(windows: &[WaitObservedWindow]) -> Option<&WaitObservedWindow> {
@@ -1210,5 +1336,146 @@ mod tests {
             Duration::from_millis(250)
         );
         assert!(parse_duration_arg("0s").is_err());
+    }
+
+    #[test]
+    fn parses_check_command_threshold_options() {
+        let cli = Cli::try_parse_from([
+            "cxst",
+            "check",
+            "--remaining-percent",
+            "12%",
+            "--window",
+            "weekly",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Check(args)) => {
+                assert_eq!(args.remaining_percent, 12.0);
+                assert_eq!(args.window, WaitWindow::Weekly);
+            }
+            other => panic!("expected check command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_with_mock_snapshot_exits_zero_when_above_threshold() {
+        let args = CheckArgs {
+            remaining_percent: 10.0,
+            window: WaitWindow::Both,
+        };
+        let rate_limits = RateLimitsOutput {
+            status: RateLimitStatus::Available,
+            reason: None,
+            limits: normalize_rate_limits(vec![snapshot(None, Some(20.0), Some(30.0))]),
+        };
+
+        let result = check_rate_limits(&rate_limits, &args, true).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["thresholdRemainingPercent"], 10.0);
+        assert_eq!(json["windows"].as_array().unwrap().len(), 2);
+        assert!(!result.stdout.contains("email"));
+        assert!(!result.stdout.contains("codexHome"));
+        assert!(!result.stdout.contains("directory"));
+        assert!(!result.stdout.contains("agentsMd"));
+        assert!(!result.stdout.contains("token"));
+    }
+
+    #[test]
+    fn check_with_mock_snapshot_exits_one_when_threshold_is_reached() {
+        let args = CheckArgs {
+            remaining_percent: 20.0,
+            window: WaitWindow::Weekly,
+        };
+        let rate_limits = RateLimitsOutput {
+            status: RateLimitStatus::Available,
+            reason: None,
+            limits: normalize_rate_limits(vec![snapshot(None, Some(20.0), Some(85.0))]),
+        };
+
+        let result = check_rate_limits(&rate_limits, &args, false).unwrap();
+
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result
+                .stdout
+                .starts_with("rate limit threshold reached: codex weekly limit 15% left <= 20%")
+        );
+    }
+
+    #[test]
+    fn check_with_mock_unavailable_rate_limits_exits_one() {
+        let args = CheckArgs {
+            remaining_percent: 10.0,
+            window: WaitWindow::Both,
+        };
+
+        let result =
+            check_rate_limits(&unavailable("chatgpt authentication required"), &args, true)
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(json["status"], "unavailable");
+        assert_eq!(json["reason"], "chatgpt authentication required");
+    }
+
+    #[test]
+    fn check_with_anonymous_snapshot_fixture_covers_wire_shape() {
+        let snapshots: Vec<RateLimitSnapshot> =
+            serde_json::from_str(include_str!("../tests/fixtures/rate_limit_snapshots.json"))
+                .unwrap();
+        let rate_limits = RateLimitsOutput {
+            status: RateLimitStatus::Available,
+            reason: None,
+            limits: normalize_rate_limits(snapshots),
+        };
+        let args = CheckArgs {
+            remaining_percent: 15.0,
+            window: WaitWindow::FiveHour,
+        };
+
+        let result = check_rate_limits(&rate_limits, &args, true).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(json["status"], "threshold_reached");
+        assert_eq!(json["thresholdRemainingPercent"], 15.0);
+        assert_eq!(json["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(json["windows"][0]["scope"], "additional_1");
+        assert_eq!(json["windows"][0]["window"], "5h");
+        assert_eq!(json["windows"][0]["remainingPercent"], 10.0);
+        assert!(!result.stdout.contains("example_additional"));
+        assert!(!result.stdout.contains("Example additional limit"));
+        assert!(!result.stdout.contains("email"));
+        assert!(!result.stdout.contains("token"));
+    }
+
+    #[test]
+    fn parses_wait_command_with_flattened_check_options() {
+        let cli = Cli::try_parse_from([
+            "cxst",
+            "wait",
+            "--remaining-percent",
+            "15",
+            "--window",
+            "5h",
+            "--interval",
+            "1m",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Wait(args)) => {
+                assert_eq!(args.check.remaining_percent, 15.0);
+                assert_eq!(args.check.window, WaitWindow::FiveHour);
+                assert_eq!(args.interval, Duration::from_secs(60));
+            }
+            other => panic!("expected wait command, got {other:?}"),
+        }
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: cxst
-description: Use when Codex needs to inspect local Codex account status, active configuration, or 5-hour/weekly rate-limit remaining usage with the cxst CLI instead of opening the Codex TUI. Trigger for requests to check Codex status, remaining usage, rate limits, active model/provider, auth state, Codex home, permissions, JSON status output, or to wait until remaining rate-limit usage reaches a threshold.
+description: Use when Codex needs to inspect local Codex account status, active configuration, or 5-hour/weekly rate-limit remaining usage with the cxst CLI instead of opening the Codex TUI. Trigger for requests to check Codex status, remaining usage, rate limits, active model/provider, auth state, Codex home, permissions, JSON status output, preflight-check remaining usage, or wait until remaining rate-limit usage reaches a threshold.
 ---
 
 # cxst Status
@@ -23,6 +23,12 @@ Machine-readable status:
 cxst --json
 ```
 
+One-shot threshold check for automation preflight:
+
+```sh
+cxst check --remaining-percent 10 --window both
+```
+
 Wait until selected remaining usage reaches a threshold:
 
 ```sh
@@ -34,14 +40,21 @@ window to monitor. `--remaining-percent` is a remaining-usage threshold: the
 command exits when any selected window is at or below that value. Use
 `--timeout` when a successful no-trigger exit is needed.
 
-Exit codes for `cxst wait`:
+Exit codes:
+
+`cxst check`:
+
+- `0`: selected rate limits are above the threshold
+- `1`: threshold reached, or rate-limit status is unavailable
+
+`cxst wait`:
 
 - `0`: timeout reached before the threshold was hit
 - `1`: threshold reached, or rate-limit status is unavailable
 
-For automation, combine `cxst wait --json` with the same wait options. JSON
+For automation, combine `--json` with the same check or wait options. JSON
 events include `status`, `thresholdRemainingPercent`, selected `windows`,
-optional `reason`, and optional `nextPollSeconds`.
+optional `reason`, and, for waiting events, optional `nextPollSeconds`.
 
 ## Alternate Codex Homes
 
