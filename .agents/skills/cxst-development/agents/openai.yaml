@@ -1,0 +1,4 @@
+interface:
+  display_name: "cxst development"
+  short_description: "Maintain the cxst repo and related docs safely"
+  default_prompt: "Use cxst-development to update cxst implementation, README, and skills consistently."
