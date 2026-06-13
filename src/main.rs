@@ -1,9 +1,15 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::process::ExitCode;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
+use clap::Args;
 use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
 use codex_backend_client::Client as BackendClient;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -34,8 +40,63 @@ struct Cli {
     #[clap(flatten)]
     config_overrides: CliConfigOverrides,
 
-    #[arg(long, help = "Print machine-readable JSON.")]
+    #[arg(long, global = true, help = "Print machine-readable JSON.")]
     json: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(about = "Show Codex account and rate-limit status.")]
+    Status,
+    #[command(about = "Wait until selected rate-limit remaining usage reaches a threshold.")]
+    Wait(WaitArgs),
+}
+
+#[derive(Debug, Args)]
+struct WaitArgs {
+    #[arg(
+        long = "remaining-percent",
+        alias = "threshold",
+        default_value = "10",
+        value_parser = parse_percent_arg,
+        help = "Exit when selected rate limits have this remaining percent or less."
+    )]
+    remaining_percent: f64,
+
+    #[arg(
+        long,
+        default_value = "both",
+        value_enum,
+        help = "Rate-limit window to watch."
+    )]
+    window: WaitWindow,
+
+    #[arg(
+        short = 'i',
+        long,
+        default_value = "60s",
+        value_parser = parse_duration_arg,
+        help = "Polling interval. Supports plain seconds, ms, s, m, or h."
+    )]
+    interval: Duration,
+
+    #[arg(
+        long,
+        value_parser = parse_duration_arg,
+        help = "Stop successfully if the threshold is not reached before this duration."
+    )]
+    timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum WaitWindow {
+    #[value(name = "5h", alias = "five-hour", alias = "five_hour")]
+    FiveHour,
+    Weekly,
+    Both,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,16 +175,50 @@ struct CodexOutput {
     model_provider: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WaitObservedWindow {
+    scope: String,
+    window: String,
+    remaining_percent: f64,
+    used_percent: f64,
+    reset_at: Option<String>,
+    reset_display: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum WaitDecision {
+    Continue(Vec<WaitObservedWindow>),
+    Triggered(Vec<WaitObservedWindow>),
+    Unavailable(String),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WaitEventOutput {
+    status: String,
+    threshold_remaining_percent: f64,
+    windows: Vec<WaitObservedWindow>,
+    reason: Option<String>,
+    next_poll_seconds: Option<u64>,
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    let output = load_status(&cli).await?;
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        print_human(&output);
+
+    match &cli.command {
+        Some(Command::Wait(args)) => run_wait(&cli, args).await,
+        Some(Command::Status) | None => {
+            let output = load_status(&cli).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                print_human(&output);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
-    Ok(())
 }
 
 async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
@@ -165,6 +260,153 @@ async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
         rate_limits,
         codex,
     })
+}
+
+async fn run_wait(cli: &Cli, args: &WaitArgs) -> anyhow::Result<ExitCode> {
+    let started = Instant::now();
+
+    loop {
+        let output = load_status(cli).await?;
+        match evaluate_wait(&output.rate_limits, args.window, args.remaining_percent) {
+            WaitDecision::Triggered(windows) => {
+                if cli.json {
+                    print_wait_json(
+                        "threshold_reached",
+                        args.remaining_percent,
+                        windows,
+                        None,
+                        None,
+                    )?;
+                } else {
+                    print_wait_triggered(args.remaining_percent, &windows);
+                }
+                return Ok(ExitCode::from(1));
+            }
+            WaitDecision::Unavailable(reason) => {
+                if cli.json {
+                    print_wait_json(
+                        "unavailable",
+                        args.remaining_percent,
+                        Vec::new(),
+                        Some(reason),
+                        None,
+                    )?;
+                } else {
+                    println!("rate limits unavailable: {reason}");
+                }
+                return Ok(ExitCode::from(1));
+            }
+            WaitDecision::Continue(windows) => {
+                if let Some(timeout) = args.timeout
+                    && started.elapsed() >= timeout
+                {
+                    if cli.json {
+                        print_wait_json("timeout", args.remaining_percent, windows, None, None)?;
+                    } else {
+                        println!("threshold not reached within {}", format_duration(timeout));
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+
+                let sleep_for = next_sleep(args.interval, args.timeout, started.elapsed());
+                if cli.json {
+                    print_wait_json(
+                        "waiting",
+                        args.remaining_percent,
+                        windows,
+                        None,
+                        Some(sleep_for.as_secs()),
+                    )?;
+                } else {
+                    print_wait_continue(args.remaining_percent, &windows, sleep_for);
+                }
+                tokio::time::sleep(sleep_for).await;
+            }
+        }
+    }
+}
+
+fn next_sleep(interval: Duration, timeout: Option<Duration>, elapsed: Duration) -> Duration {
+    match timeout.and_then(|timeout| timeout.checked_sub(elapsed)) {
+        Some(remaining) => interval.min(remaining),
+        None => interval,
+    }
+}
+
+fn evaluate_wait(
+    rate_limits: &RateLimitsOutput,
+    window: WaitWindow,
+    threshold: f64,
+) -> WaitDecision {
+    if matches!(rate_limits.status, RateLimitStatus::Unavailable) {
+        return WaitDecision::Unavailable(
+            rate_limits
+                .reason
+                .clone()
+                .unwrap_or_else(|| "rate limits unavailable".to_string()),
+        );
+    }
+
+    let windows = selected_wait_windows(rate_limits, window);
+    if windows.is_empty() {
+        return WaitDecision::Unavailable("no selected rate limit windows returned".to_string());
+    }
+
+    let triggered = windows
+        .iter()
+        .filter(|window| window.remaining_percent <= threshold)
+        .cloned()
+        .collect::<Vec<_>>();
+    if triggered.is_empty() {
+        WaitDecision::Continue(windows)
+    } else {
+        WaitDecision::Triggered(triggered)
+    }
+}
+
+fn selected_wait_windows(
+    rate_limits: &RateLimitsOutput,
+    selection: WaitWindow,
+) -> Vec<WaitObservedWindow> {
+    let mut windows = Vec::new();
+    for limit in &rate_limits.limits {
+        if selection.includes_five_hour()
+            && let Some(window) = &limit.five_hour
+        {
+            windows.push(wait_observed_window(&limit.scope, "5h", window));
+        }
+        if selection.includes_weekly()
+            && let Some(window) = &limit.weekly
+        {
+            windows.push(wait_observed_window(&limit.scope, "weekly", window));
+        }
+    }
+    windows
+}
+
+fn wait_observed_window(
+    scope: &str,
+    label: &str,
+    window: &RateLimitWindowOutput,
+) -> WaitObservedWindow {
+    WaitObservedWindow {
+        scope: scope.to_string(),
+        window: label.to_string(),
+        remaining_percent: window.remaining_percent,
+        used_percent: window.used_percent,
+        reset_at: window.reset_at.clone(),
+        reset_display: window.reset_display.clone(),
+    }
+}
+
+impl WaitWindow {
+    fn includes_five_hour(self) -> bool {
+        matches!(self, WaitWindow::FiveHour | WaitWindow::Both)
+    }
+
+    fn includes_weekly(self) -> bool {
+        matches!(self, WaitWindow::Weekly | WaitWindow::Both)
+    }
 }
 
 fn codex_output_from_config(config: &Config) -> CodexOutput {
@@ -641,6 +883,144 @@ fn print_limit_window(label: &str, window: Option<&RateLimitWindowOutput>) {
     }
 }
 
+fn print_wait_triggered(threshold: f64, windows: &[WaitObservedWindow]) {
+    for window in windows {
+        println!(
+            "rate limit threshold reached: {} {} limit {:.0}% left <= {:.0}%{}",
+            window.scope,
+            window.window,
+            window.remaining_percent,
+            threshold,
+            wait_reset_suffix(window)
+        );
+    }
+}
+
+fn print_wait_continue(threshold: f64, windows: &[WaitObservedWindow], sleep_for: Duration) {
+    if let Some(lowest) = lowest_remaining_window(windows) {
+        println!(
+            "waiting: lowest selected limit is {} {} limit {:.0}% left (threshold {:.0}%, next poll in {}){}",
+            lowest.scope,
+            lowest.window,
+            lowest.remaining_percent,
+            threshold,
+            format_duration(sleep_for),
+            wait_reset_suffix(lowest)
+        );
+    }
+}
+
+fn print_wait_json(
+    status: &str,
+    threshold: f64,
+    windows: Vec<WaitObservedWindow>,
+    reason: Option<String>,
+    next_poll_seconds: Option<u64>,
+) -> anyhow::Result<()> {
+    let output = WaitEventOutput {
+        status: status.to_string(),
+        threshold_remaining_percent: threshold,
+        windows,
+        reason,
+        next_poll_seconds,
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+fn lowest_remaining_window(windows: &[WaitObservedWindow]) -> Option<&WaitObservedWindow> {
+    windows
+        .iter()
+        .min_by(|left, right| left.remaining_percent.total_cmp(&right.remaining_percent))
+}
+
+fn wait_reset_suffix(window: &WaitObservedWindow) -> String {
+    window
+        .reset_display
+        .as_ref()
+        .map(|reset| format!(" (resets {reset})"))
+        .unwrap_or_default()
+}
+
+fn parse_percent_arg(raw: &str) -> Result<f64, String> {
+    let value = raw
+        .trim()
+        .strip_suffix('%')
+        .unwrap_or(raw.trim())
+        .parse::<f64>()
+        .map_err(|_| "expected a percentage from 0 to 100".to_string())?;
+    if (0.0..=100.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("expected a percentage from 0 to 100".to_string())
+    }
+}
+
+fn parse_duration_arg(raw: &str) -> Result<Duration, String> {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err("expected a duration".to_string());
+    }
+
+    let suffixes = [
+        ("milliseconds", 1_u64),
+        ("millisecond", 1),
+        ("millis", 1),
+        ("ms", 1),
+        ("minutes", 60_000),
+        ("minute", 60_000),
+        ("mins", 60_000),
+        ("min", 60_000),
+        ("hours", 3_600_000),
+        ("hour", 3_600_000),
+        ("hrs", 3_600_000),
+        ("hr", 3_600_000),
+        ("seconds", 1_000),
+        ("second", 1_000),
+        ("secs", 1_000),
+        ("sec", 1_000),
+        ("h", 3_600_000),
+        ("m", 60_000),
+        ("s", 1_000),
+    ];
+
+    let (number, multiplier) = suffixes
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            value
+                .strip_suffix(suffix)
+                .map(|number| (number.trim(), *multiplier))
+        })
+        .unwrap_or((value.as_str(), 1_000));
+
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| "expected a positive duration such as 60s or 1m".to_string())?;
+    let millis = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_string())?;
+    if millis == 0 {
+        return Err("expected a positive duration".to_string());
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{millis}ms");
+    }
+
+    let seconds = duration.as_secs();
+    if seconds.is_multiple_of(3_600) {
+        format!("{}h", seconds / 3_600)
+    } else if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn percent_bar(percent: f64) -> String {
     let width = 20;
     let filled = ((percent.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
@@ -751,5 +1131,84 @@ mod tests {
         assert_eq!(output.email.as_deref(), Some("user@example.invalid"));
         assert_eq!(output.plan_type.as_deref(), Some("pro"));
         assert!(json.contains("user@example.invalid"));
+    }
+
+    #[test]
+    fn wait_evaluation_triggers_only_selected_window() {
+        let rate_limits = RateLimitsOutput {
+            status: RateLimitStatus::Available,
+            reason: None,
+            limits: normalize_rate_limits(vec![snapshot(None, Some(10.0), Some(82.0))]),
+        };
+
+        let five_hour = evaluate_wait(&rate_limits, WaitWindow::FiveHour, 20.0);
+        assert!(matches!(five_hour, WaitDecision::Continue(_)));
+
+        let weekly = evaluate_wait(&rate_limits, WaitWindow::Weekly, 20.0);
+        match weekly {
+            WaitDecision::Triggered(windows) => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].scope, "codex");
+                assert_eq!(windows[0].window, "weekly");
+                assert_eq!(windows[0].remaining_percent, 18.0);
+            }
+            other => panic!("expected weekly trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_evaluation_reports_unavailable_reason() {
+        let decision = evaluate_wait(
+            &unavailable("chatgpt authentication required"),
+            WaitWindow::Both,
+            10.0,
+        );
+
+        assert_eq!(
+            decision,
+            WaitDecision::Unavailable("chatgpt authentication required".to_string())
+        );
+    }
+
+    #[test]
+    fn wait_evaluation_handles_missing_selected_windows() {
+        let rate_limits = RateLimitsOutput {
+            status: RateLimitStatus::Available,
+            reason: None,
+            limits: normalize_rate_limits(vec![snapshot(None, Some(10.0), None)]),
+        };
+
+        assert_eq!(
+            evaluate_wait(&rate_limits, WaitWindow::Weekly, 10.0),
+            WaitDecision::Unavailable("no selected rate limit windows returned".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_wait_percentages() {
+        assert_eq!(parse_percent_arg("10").unwrap(), 10.0);
+        assert_eq!(parse_percent_arg("10%").unwrap(), 10.0);
+        assert!(parse_percent_arg("-1").is_err());
+        assert!(parse_percent_arg("101").is_err());
+    }
+
+    #[test]
+    fn parses_wait_durations() {
+        assert_eq!(parse_duration_arg("1").unwrap(), Duration::from_secs(1));
+        assert_eq!(parse_duration_arg("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration_arg("1m").unwrap(), Duration::from_secs(60));
+        assert_eq!(
+            parse_duration_arg("1 minute").unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_duration_arg("1h").unwrap(),
+            Duration::from_secs(3_600)
+        );
+        assert_eq!(
+            parse_duration_arg("250ms").unwrap(),
+            Duration::from_millis(250)
+        );
+        assert!(parse_duration_arg("0s").is_err());
     }
 }
