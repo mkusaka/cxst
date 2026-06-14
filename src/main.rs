@@ -110,6 +110,8 @@ enum WaitWindow {
     #[value(name = "5h", alias = "five-hour", alias = "five_hour")]
     FiveHour,
     Weekly,
+    Monthly,
+    #[value(alias = "all")]
     Both,
 }
 
@@ -163,6 +165,7 @@ struct RateLimitOutput {
     plan_type: Option<String>,
     five_hour: Option<RateLimitWindowOutput>,
     weekly: Option<RateLimitWindowOutput>,
+    monthly: Option<RateLimitWindowOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -471,6 +474,11 @@ fn selected_wait_windows(
         {
             windows.push(wait_observed_window(&limit.scope, "weekly", window));
         }
+        if selection.includes_monthly()
+            && let Some(window) = &limit.monthly
+        {
+            windows.push(wait_observed_window(&limit.scope, "monthly", window));
+        }
     }
     windows
 }
@@ -497,6 +505,10 @@ impl WaitWindow {
 
     fn includes_weekly(self) -> bool {
         matches!(self, WaitWindow::Weekly | WaitWindow::Both)
+    }
+
+    fn includes_monthly(self) -> bool {
+        matches!(self, WaitWindow::Monthly | WaitWindow::Both)
     }
 }
 
@@ -616,14 +628,81 @@ fn normalize_rate_limits(snapshots: Vec<RateLimitSnapshot>) -> Vec<RateLimitOutp
                 additional_index += 1;
                 format!("additional_{additional_index}")
             };
-            RateLimitOutput {
+            let mut output = RateLimitOutput {
                 scope,
                 plan_type: snapshot.plan_type.as_ref().map(plan_type_label),
-                five_hour: snapshot.primary.as_ref().map(window_output),
-                weekly: snapshot.secondary.as_ref().map(window_output),
-            }
+                five_hour: None,
+                weekly: None,
+                monthly: None,
+            };
+            assign_rate_limit_window(
+                &mut output,
+                snapshot.primary.as_ref(),
+                WindowFallback::Primary,
+            );
+            assign_rate_limit_window(
+                &mut output,
+                snapshot.secondary.as_ref(),
+                WindowFallback::Secondary,
+            );
+            output
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum RateLimitWindowKind {
+    FiveHour,
+    Weekly,
+    Monthly,
+}
+
+#[derive(Clone, Copy)]
+enum WindowFallback {
+    Primary,
+    Secondary,
+}
+
+fn assign_rate_limit_window(
+    output: &mut RateLimitOutput,
+    window: Option<&RateLimitWindow>,
+    fallback: WindowFallback,
+) {
+    let Some(window) = window else {
+        return;
+    };
+    let value = window_output(window);
+    match window_kind(window.window_minutes).unwrap_or_else(|| fallback_window_kind(fallback)) {
+        RateLimitWindowKind::FiveHour => output.five_hour = Some(value),
+        RateLimitWindowKind::Weekly => output.weekly = Some(value),
+        RateLimitWindowKind::Monthly => output.monthly = Some(value),
+    }
+}
+
+fn fallback_window_kind(fallback: WindowFallback) -> RateLimitWindowKind {
+    match fallback {
+        WindowFallback::Primary => RateLimitWindowKind::FiveHour,
+        WindowFallback::Secondary => RateLimitWindowKind::Weekly,
+    }
+}
+
+fn window_kind(window_minutes: Option<i64>) -> Option<RateLimitWindowKind> {
+    let minutes = window_minutes?.max(0);
+    if is_approximate_window(minutes, 5 * 60) {
+        Some(RateLimitWindowKind::FiveHour)
+    } else if is_approximate_window(minutes, 7 * 24 * 60) {
+        Some(RateLimitWindowKind::Weekly)
+    } else if is_approximate_window(minutes, 30 * 24 * 60) {
+        Some(RateLimitWindowKind::Monthly)
+    } else {
+        None
+    }
+}
+
+fn is_approximate_window(minutes: i64, expected_minutes: i64) -> bool {
+    let minutes = minutes as f64;
+    let expected_minutes = expected_minutes as f64;
+    minutes >= expected_minutes * 0.95 && minutes <= expected_minutes * 1.05
 }
 
 fn window_output(window: &RateLimitWindow) -> RateLimitWindowOutput {
@@ -910,7 +989,13 @@ fn print_human(output: &StatusOutput) {
             println!("  unavailable     {reason}");
         }
         RateLimitStatus::Available => {
-            if output.rate_limits.limits.is_empty() {
+            if output.rate_limits.limits.is_empty()
+                || !output
+                    .rate_limits
+                    .limits
+                    .iter()
+                    .any(limit_has_displayable_window)
+            {
                 println!("  unavailable     no displayable limits");
                 return;
             }
@@ -920,9 +1005,14 @@ fn print_human(output: &StatusOutput) {
                 }
                 print_limit_window("5h limit", limit.five_hour.as_ref());
                 print_limit_window("Weekly limit", limit.weekly.as_ref());
+                print_limit_window("Monthly limit", limit.monthly.as_ref());
             }
         }
     }
+}
+
+fn limit_has_displayable_window(limit: &RateLimitOutput) -> bool {
+    limit.five_hour.is_some() || limit.weekly.is_some() || limit.monthly.is_some()
 }
 
 fn model_status_label(codex: &CodexOutput) -> String {
@@ -959,19 +1049,17 @@ fn auth_status_label(auth: &AuthOutput) -> String {
 }
 
 fn print_limit_window(label: &str, window: Option<&RateLimitWindowOutput>) {
-    match window {
-        Some(window) => {
-            let reset = window.reset_display.as_deref().unwrap_or("-");
-            println!(
-                "  {:<18} {} {:>3.0}% left (resets {})",
-                label,
-                percent_bar(window.remaining_percent),
-                window.remaining_percent,
-                reset
-            );
-        }
-        None => println!("  {label:<15} unavailable"),
-    }
+    let Some(window) = window else {
+        return;
+    };
+    let reset = window.reset_display.as_deref().unwrap_or("-");
+    println!(
+        "  {:<18} {} {:>3.0}% left (resets {})",
+        label,
+        percent_bar(window.remaining_percent),
+        window.remaining_percent,
+        reset
+    );
 }
 
 fn format_check_ok(threshold: f64, windows: &[WaitObservedWindow]) -> String {
@@ -1169,17 +1257,27 @@ mod tests {
         primary: Option<f64>,
         secondary: Option<f64>,
     ) -> RateLimitSnapshot {
+        snapshot_with_window_minutes(limit_id, primary, Some(300), secondary, Some(10_080))
+    }
+
+    fn snapshot_with_window_minutes(
+        limit_id: Option<&str>,
+        primary: Option<f64>,
+        primary_window_minutes: Option<i64>,
+        secondary: Option<f64>,
+        secondary_window_minutes: Option<i64>,
+    ) -> RateLimitSnapshot {
         RateLimitSnapshot {
             limit_id: limit_id.map(str::to_string),
             limit_name: None,
             primary: primary.map(|used_percent| RateLimitWindow {
                 used_percent,
-                window_minutes: Some(300),
+                window_minutes: primary_window_minutes,
                 resets_at: Some(1_700_000_000),
             }),
             secondary: secondary.map(|used_percent| RateLimitWindow {
                 used_percent,
-                window_minutes: Some(10_080),
+                window_minutes: secondary_window_minutes,
                 resets_at: Some(1_700_360_000),
             }),
             credits: None::<CreditsSnapshot>,
@@ -1200,6 +1298,23 @@ mod tests {
             75.0
         );
         assert_eq!(limits[0].weekly.as_ref().unwrap().remaining_percent, 60.0);
+    }
+
+    #[test]
+    fn normalizes_monthly_primary_window_by_duration() {
+        let limits = normalize_rate_limits(vec![snapshot_with_window_minutes(
+            None,
+            Some(27.0),
+            Some(43_200),
+            None,
+            None,
+        )]);
+
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].scope, "codex");
+        assert!(limits[0].five_hour.is_none());
+        assert!(limits[0].weekly.is_none());
+        assert_eq!(limits[0].monthly.as_ref().unwrap().remaining_percent, 73.0);
     }
 
     #[test]
@@ -1283,6 +1398,31 @@ mod tests {
     }
 
     #[test]
+    fn wait_evaluation_can_select_monthly_window() {
+        let rate_limits = RateLimitsOutput {
+            status: RateLimitStatus::Available,
+            reason: None,
+            limits: normalize_rate_limits(vec![snapshot_with_window_minutes(
+                None,
+                Some(88.0),
+                Some(43_200),
+                None,
+                None,
+            )]),
+        };
+
+        match evaluate_wait(&rate_limits, WaitWindow::Monthly, 15.0) {
+            WaitDecision::Triggered(windows) => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].scope, "codex");
+                assert_eq!(windows[0].window, "monthly");
+                assert_eq!(windows[0].remaining_percent, 12.0);
+            }
+            other => panic!("expected monthly trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn wait_evaluation_reports_unavailable_reason() {
         let decision = evaluate_wait(
             &unavailable("chatgpt authentication required"),
@@ -1354,6 +1494,48 @@ mod tests {
             Some(Command::Check(args)) => {
                 assert_eq!(args.remaining_percent, 12.0);
                 assert_eq!(args.window, WaitWindow::Weekly);
+            }
+            other => panic!("expected check command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_check_command_monthly_window() {
+        let cli = Cli::try_parse_from([
+            "cxst",
+            "check",
+            "--remaining-percent",
+            "25",
+            "--window",
+            "monthly",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Check(args)) => {
+                assert_eq!(args.remaining_percent, 25.0);
+                assert_eq!(args.window, WaitWindow::Monthly);
+            }
+            other => panic!("expected check command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_check_command_all_window_alias() {
+        let cli = Cli::try_parse_from([
+            "cxst",
+            "check",
+            "--remaining-percent",
+            "25",
+            "--window",
+            "all",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Check(args)) => {
+                assert_eq!(args.remaining_percent, 25.0);
+                assert_eq!(args.window, WaitWindow::Both);
             }
             other => panic!("expected check command, got {other:?}"),
         }
@@ -1451,8 +1633,23 @@ mod tests {
         assert_eq!(json["windows"][0]["remainingPercent"], 10.0);
         assert!(!result.stdout.contains("example_additional"));
         assert!(!result.stdout.contains("Example additional limit"));
+        assert!(!result.stdout.contains("zz_example_monthly"));
         assert!(!result.stdout.contains("email"));
         assert!(!result.stdout.contains("token"));
+
+        let args = CheckArgs {
+            remaining_percent: 75.0,
+            window: WaitWindow::Monthly,
+        };
+        let result = check_rate_limits(&rate_limits, &args, true).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(json["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(json["windows"][0]["scope"], "additional_2");
+        assert_eq!(json["windows"][0]["window"], "monthly");
+        assert_eq!(json["windows"][0]["remainingPercent"], 73.0);
+        assert!(!result.stdout.contains("zz_example_monthly"));
     }
 
     #[test]

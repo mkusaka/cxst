@@ -33,6 +33,7 @@ Codex status
 Rate limits
   5h limit          [████████████████░░░░]  83% left (resets 19:31)
   Weekly limit      [███████░░░░░░░░░░░░░]  33% left (resets 23:37 on 16 Jun)
+  Monthly limit     [███████████████░░░░░]  73% left (resets 14:40 on 14 Jul)
 ```
 
 `--json` prints machine-readable JSON with the same core fields plus raw
@@ -47,6 +48,10 @@ unavailable.
 threshold is reached or rate-limit status is unavailable. If `--timeout` is set
 and the threshold is not reached before the timeout, it exits `0`.
 
+Use `--window 5h`, `--window weekly`, `--window monthly`, or `--window all`
+with `cxst check` and `cxst wait`. `both` remains accepted as a backwards
+compatible alias for all windows.
+
 ## Scope
 
 Included:
@@ -54,7 +59,7 @@ Included:
 - auth/account status as `chatgpt`, `api_key`, `unauthenticated`, or similar
 - active Codex model/provider, working directory, permission summary, Codex
   home, collaboration mode, and configured instruction source paths
-- 5-hour and weekly remaining percentages from the rate-limit snapshot
+- 5-hour, weekly, and monthly remaining percentages from the rate-limit snapshot
 - reset timestamps and window length when returned by the backend
 
 Not included:

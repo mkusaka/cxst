@@ -1,6 +1,6 @@
 ---
 name: cxst
-description: Use when Codex needs to inspect local Codex account status, active configuration, or 5-hour/weekly rate-limit remaining usage with the cxst CLI instead of opening the Codex TUI. Trigger for requests to check Codex status, remaining usage, rate limits, active model/provider, auth state, Codex home, permissions, JSON status output, preflight-check remaining usage, or wait until remaining rate-limit usage reaches a threshold.
+description: Use when Codex needs to inspect local Codex account status, active configuration, or 5-hour/weekly/monthly rate-limit remaining usage with the cxst CLI instead of opening the Codex TUI. Trigger for requests to check Codex status, remaining usage, rate limits, active model/provider, auth state, Codex home, permissions, JSON status output, preflight-check remaining usage, or wait until remaining rate-limit usage reaches a threshold.
 ---
 
 # cxst Status
@@ -35,10 +35,11 @@ Wait until selected remaining usage reaches a threshold:
 cxst wait --remaining-percent 10 --window both --interval 60s
 ```
 
-Use `--window 5h`, `--window weekly`, or `--window both` to choose which limit
-window to monitor. `--remaining-percent` is a remaining-usage threshold: the
-command exits when any selected window is at or below that value. Use
-`--timeout` when a successful no-trigger exit is needed.
+Use `--window 5h`, `--window weekly`, `--window monthly`, or `--window all` to
+choose which limit window to monitor. `both` remains accepted as a backwards
+compatible alias for all windows. `--remaining-percent` is a remaining-usage
+threshold: the command exits when any selected window is at or below that value.
+Use `--timeout` when a successful no-trigger exit is needed.
 
 Exit codes:
 
@@ -79,7 +80,7 @@ Use the output fields as reported by `cxst`:
 - working directory and Codex home
 - permission summary
 - configured instruction source paths
-- 5-hour and weekly rate-limit remaining percentages
+- 5-hour, weekly, and monthly rate-limit remaining percentages
 - reset timestamps or reset display times when available
 
 If rate limits are unavailable, report the short reason from `cxst` and avoid
