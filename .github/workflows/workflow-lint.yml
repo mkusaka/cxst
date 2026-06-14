@@ -1,0 +1,171 @@
+name: workflow-lint
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/ghalint.yaml"
+      - ".pinact.yaml"
+      - "zizmor.yml"
+      - "renovate.json5"
+    types:
+      - opened
+      - reopened
+      - synchronize
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Download actionlint
+        id: get_actionlint
+        env:
+          # renovate: datasource=github-releases depName=rhysd/actionlint
+          ACTIONLINT_VERSION: v1.7.12
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -sSfL -H "Authorization: token $GITHUB_TOKEN" -o /tmp/download-actionlint.bash "https://raw.githubusercontent.com/rhysd/actionlint/$ACTIONLINT_VERSION/scripts/download-actionlint.bash"
+          bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION#v}"
+        shell: bash
+      - name: Check workflow files
+        env:
+          ACTIONLINT_EXECUTABLE: ${{ steps.get_actionlint.outputs.executable }}
+        run: |
+          "$ACTIONLINT_EXECUTABLE" -color
+        shell: bash
+
+  ghalint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Download ghalint
+        env:
+          # renovate: datasource=github-releases depName=suzuki-shunsuke/ghalint
+          GHALINT_VERSION: v1.5.6
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          archive="ghalint_${GHALINT_VERSION#v}_linux_amd64.tar.gz"
+          curl -sSfL -H "Authorization: token $GITHUB_TOKEN" -o "/tmp/$archive" "https://github.com/suzuki-shunsuke/ghalint/releases/download/$GHALINT_VERSION/$archive"
+          curl -sSfL -H "Authorization: token $GITHUB_TOKEN" -o /tmp/ghalint_checksums.txt "https://github.com/suzuki-shunsuke/ghalint/releases/download/$GHALINT_VERSION/ghalint_${GHALINT_VERSION#v}_checksums.txt"
+          (cd /tmp && grep " $archive\$" ghalint_checksums.txt | sha256sum -c -)
+          tar -xzf "/tmp/$archive" -C /tmp
+          sudo install -m 0755 /tmp/ghalint /usr/local/bin/ghalint
+          ghalint version
+        shell: bash
+      - name: Check workflow files
+        run: ghalint run
+        shell: bash
+      - name: Check action files
+        run: ghalint run-action
+        shell: bash
+
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    env:
+      # renovate: datasource=github-releases depName=zizmorcore/zizmor
+      ZIZMOR_VERSION: v1.25.2
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Run zizmor security check
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        with:
+          inputs: .github/workflows/
+          min-severity: medium
+          token: ${{ github.token }}
+          advanced-security: false
+          annotations: true
+          version: ${{ env.ZIZMOR_VERSION }}
+
+  codeql-actions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      # renovate: datasource=github-releases depName=reviewdog/reviewdog
+      REVIEWDOG_VERSION: v0.21.0
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          languages: actions
+          queries: security-extended,security-and-quality
+      - name: Perform CodeQL analysis
+        id: analyze
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          category: /language:actions
+          output: ../results
+          upload: never
+          upload-database: false
+      - name: Set up reviewdog
+        uses: reviewdog/action-setup@d8edfce3dd5e1ec6978745e801f9c50b5ef80252 # v1.4.0
+        with:
+          reviewdog_version: ${{ env.REVIEWDOG_VERSION }}
+      - name: Report CodeQL findings
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
+          SARIF_DIR: ${{ steps.analyze.outputs.sarif-output }}
+        run: |
+          set -euo pipefail
+          sarif_file="$(find "$SARIF_DIR" -name "*.sarif" -print -quit)"
+          if [[ -z "$sarif_file" ]]; then
+            echo "No CodeQL SARIF file was generated." >&2
+            exit 1
+          fi
+          reviewdog \
+            -f=sarif \
+            -name=codeql-actions \
+            -reporter=github-pr-review \
+            -filter-mode=added \
+            -fail-level=error \
+            < "$sarif_file"
+        shell: bash
+
+  pinact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Download pinact
+        env:
+          # renovate: datasource=github-releases depName=suzuki-shunsuke/pinact
+          PINACT_VERSION: v3.10.1
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          archive="pinact_linux_amd64.tar.gz"
+          curl -sSfL -H "Authorization: token $GITHUB_TOKEN" -o "/tmp/$archive" "https://github.com/suzuki-shunsuke/pinact/releases/download/$PINACT_VERSION/$archive"
+          curl -sSfL -H "Authorization: token $GITHUB_TOKEN" -o /tmp/pinact_checksums.txt "https://github.com/suzuki-shunsuke/pinact/releases/download/$PINACT_VERSION/pinact_${PINACT_VERSION#v}_checksums.txt"
+          (cd /tmp && grep " $archive\$" pinact_checksums.txt | sha256sum -c -)
+          tar -xzf "/tmp/$archive" -C /tmp
+          sudo install -m 0755 /tmp/pinact /usr/local/bin/pinact
+          pinact version
+        shell: bash
+      - name: Check pinned action refs
+        run: pinact run --check
+        shell: bash
