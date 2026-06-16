@@ -44,8 +44,10 @@ timestamps and window metadata when available.
 
 `cxst usage [daily|weekly|cumulative]` prints account token activity for the
 last 12 months. Human output includes the lifetime, peak daily usage, streak,
-longest task duration, and a compact activity chart. `cxst usage --json` prints
-the same summary plus `dailyUsageBuckets` with synthetic-safe field names:
+longest task duration, and a TUI-style 52-week activity chart. Daily renders a
+calendar heatmap; weekly and cumulative render 7-row bar charts with a caption
+for the scale. `cxst usage --json` prints the same summary plus
+`dailyUsageBuckets` with synthetic-safe field names:
 
 ```json
 {

@@ -35,6 +35,10 @@ use codex_utils_cli::CliConfigOverrides;
 use codex_utils_sandbox_summary::summarize_permission_profile;
 use serde::Serialize;
 
+const USAGE_WEEK_COUNT: usize = 52;
+const USAGE_DAY_COUNT: usize = 7;
+const USAGE_CELL_COUNT: usize = USAGE_WEEK_COUNT * USAGE_DAY_COUNT;
+
 #[derive(Debug, Parser)]
 #[command(name = "cxst")]
 #[command(about = "Show Codex account and rate-limit status.")]
@@ -1176,18 +1180,19 @@ fn print_human(output: &StatusOutput) {
 }
 
 fn print_usage_human(output: &UsageOutput) {
-    println!("Token activity   last 12 months");
+    println!(" Token activity   last 12 months");
     match output.status {
         UsageStatus::Unavailable => {
             let reason = output.reason.as_deref().unwrap_or("unavailable");
-            println!("  unavailable     {reason}");
+            println!("   unavailable     {reason}");
         }
         UsageStatus::Available => {
             if let Some(summary) = &output.summary {
-                println!("  {}", usage_summary_line(summary));
+                println!(" {}", usage_summary_line(summary));
             }
             match output.daily_usage_buckets.as_deref() {
                 Some(buckets) => {
+                    println!();
                     for line in token_activity_lines(
                         output.view,
                         buckets,
@@ -1196,7 +1201,7 @@ fn print_usage_human(output: &UsageOutput) {
                         println!("{line}");
                     }
                 }
-                None => println!("  Token activity history unavailable"),
+                None => println!("   Token activity history unavailable"),
             }
         }
     }
@@ -1448,9 +1453,9 @@ fn token_activity_lines(
     today: chrono::NaiveDate,
 ) -> Vec<String> {
     let weeks = activity_weeks(today);
-    let values = activity_values(buckets, &weeks, today);
+    let values = daily_values(buckets, today);
     match view {
-        UsageView::Daily => daily_activity_lines(&weeks, &values),
+        UsageView::Daily => daily_activity_lines(&weeks, &values, today),
         UsageView::Weekly | UsageView::Cumulative => {
             aggregate_activity_lines(view, &weeks, &values)
         }
@@ -1458,141 +1463,212 @@ fn token_activity_lines(
 }
 
 fn activity_weeks(today: chrono::NaiveDate) -> Vec<chrono::NaiveDate> {
+    let start = chart_start(today);
+    (0..USAGE_WEEK_COUNT)
+        .map(|week| start + chrono::Duration::weeks(week as i64))
+        .collect()
+}
+
+fn daily_values(buckets: &[UsageDailyBucketOutput], today: chrono::NaiveDate) -> Vec<i64> {
+    let start = chart_start(today);
+    let end = start + chrono::Duration::days(USAGE_CELL_COUNT as i64);
+    let mut by_date = BTreeMap::new();
+    for bucket in buckets {
+        let Ok(date) = chrono::NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < start || date >= end || date > today {
+            continue;
+        }
+        *by_date.entry(date).or_insert(0) += bucket.tokens.max(0);
+    }
+
+    (0..USAGE_CELL_COUNT)
+        .map(|offset| {
+            by_date
+                .get(&(start + chrono::Duration::days(offset as i64)))
+                .copied()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn chart_start(today: chrono::NaiveDate) -> chrono::NaiveDate {
     use chrono::Datelike;
 
-    let days_until_saturday = 6_i64 - i64::from(today.weekday().num_days_from_sunday());
-    let end = today + chrono::Duration::days(days_until_saturday);
-    let start = end - chrono::Duration::days((52 * 7 - 1) as i64);
-    (0..52)
-        .map(|week| start + chrono::Duration::days((week * 7) as i64))
-        .collect()
+    let week_start =
+        today - chrono::Duration::days(i64::from(today.weekday().num_days_from_sunday()));
+    week_start - chrono::Duration::weeks((USAGE_WEEK_COUNT - 1) as i64)
 }
 
-fn activity_values(
-    buckets: &[UsageDailyBucketOutput],
+fn daily_activity_lines(
     weeks: &[chrono::NaiveDate],
+    values: &[i64],
     today: chrono::NaiveDate,
-) -> Vec<Option<i64>> {
-    let by_date = buckets
-        .iter()
-        .filter_map(|bucket| {
-            let date = chrono::NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok()?;
-            Some((date, bucket.tokens.max(0)))
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    weeks
-        .iter()
-        .flat_map(|week_start| {
-            (0..7).map(|day| {
-                let date = *week_start + chrono::Duration::days(day);
-                if date > today {
-                    None
-                } else {
-                    Some(*by_date.get(&date).unwrap_or(&0))
-                }
-            })
-        })
-        .collect()
-}
-
-fn daily_activity_lines(weeks: &[chrono::NaiveDate], values: &[Option<i64>]) -> Vec<String> {
-    let levels = activity_levels(values);
+) -> Vec<String> {
+    let levels = graded_levels(values);
     let mut lines = vec![month_header(weeks)];
-    for row in 0..7 {
+    for row in 0..USAGE_DAY_COUNT {
         let mut line = format!(" {:<2}", weekday_abbrev(row));
-        for column in 0..52 {
-            let index = column * 7 + row;
+        for (column, week_start) in weeks.iter().enumerate().take(USAGE_WEEK_COUNT) {
+            let index = column * USAGE_DAY_COUNT + row;
+            let date = *week_start + chrono::Duration::days(row as i64);
             line.push(' ');
-            line.push(activity_glyph(levels[index], true));
+            line.push(if date > today {
+                ' '
+            } else {
+                daily_activity_glyph(levels[index])
+            });
         }
         lines.push(line);
     }
-    lines.push("     · none  ░ low  ▒ medium  ▓ high  █ peak".to_string());
+    lines.push(String::new());
+    lines.push("   Less □ ■ ■ ■ ■ More".to_string());
+    lines.push("   daily · weekly · cumulative".to_string());
     lines
 }
 
 fn aggregate_activity_lines(
     view: UsageView,
     weeks: &[chrono::NaiveDate],
-    values: &[Option<i64>],
+    values: &[i64],
 ) -> Vec<String> {
-    let mut totals = weekly_totals(values);
-    if view == UsageView::Cumulative {
-        let mut running = 0;
-        for total in &mut totals {
-            running += *total;
-            *total = running;
-        }
-    }
-    let levels = activity_levels(&totals.iter().copied().map(Some).collect::<Vec<_>>());
-    let mut line = "     ".to_string();
-    for level in levels {
-        line.push(' ');
-        line.push(activity_glyph(level, false));
-    }
-    let label = match view {
-        UsageView::Weekly => "Weekly total",
-        UsageView::Cumulative => "Running total",
+    let totals = weekly_totals(values);
+    let display_totals = match view {
+        UsageView::Weekly => totals,
+        UsageView::Cumulative => totals
+            .into_iter()
+            .scan(0, |sum, value| {
+                *sum += value;
+                Some(*sum)
+            })
+            .collect(),
         UsageView::Daily => unreachable!(),
     };
-    let peak = totals.iter().copied().max().unwrap_or(0);
-    vec![
-        month_header(weeks),
-        line,
-        format!("     {label} · top {}", format_tokens_compact(peak)),
-    ]
+    let levels = bar_levels(&display_totals);
+    let mut lines = vec![month_header(weeks)];
+    for row in 0..USAGE_DAY_COUNT {
+        let mut line = weekday_or_axis_label(view, row).to_string();
+        for column in 0..USAGE_WEEK_COUNT {
+            if column > 0 {
+                line.push(' ');
+            }
+            let index = column * USAGE_DAY_COUNT + row;
+            line.push(if levels[index] > 0 { '█' } else { ' ' });
+        }
+        lines.push(line);
+    }
+    lines.push(String::new());
+    lines.push(bar_caption(view, &display_totals));
+    lines.push("   daily · weekly · cumulative".to_string());
+    lines
 }
 
-fn weekly_totals(values: &[Option<i64>]) -> Vec<i64> {
+fn weekly_totals(values: &[i64]) -> Vec<i64> {
     values
-        .chunks(7)
-        .map(|week| week.iter().flatten().sum::<i64>())
+        .chunks(USAGE_DAY_COUNT)
+        .map(|week| week.iter().sum())
         .collect()
 }
 
-fn activity_levels(values: &[Option<i64>]) -> Vec<Option<usize>> {
-    let peak = values.iter().flatten().copied().max().unwrap_or(0);
+fn graded_levels(values: &[i64]) -> Vec<usize> {
+    let peak = values.iter().copied().max().unwrap_or(0);
     values
         .iter()
-        .map(|value| {
-            let value = (*value)?;
-            if value == 0 || peak == 0 {
-                Some(0)
-            } else {
-                Some(((value as f64 / peak as f64) * 4.0).ceil() as usize)
-            }
+        .map(|value| match (*value, peak) {
+            (0, _) | (_, 0) => 0,
+            (value, peak) if value * 4 > peak * 3 => 4,
+            (value, peak) if value * 2 > peak => 3,
+            (value, peak) if value * 4 > peak => 2,
+            _ => 1,
         })
         .collect()
 }
 
-fn activity_glyph(level: Option<usize>, daily: bool) -> char {
+fn bar_levels(totals: &[i64]) -> Vec<usize> {
+    let peak = totals.iter().copied().max().unwrap_or(0);
+    totals
+        .iter()
+        .flat_map(|value| {
+            let height = if *value <= 0 || peak <= 0 {
+                0
+            } else {
+                ((*value * USAGE_DAY_COUNT as i64 + peak - 1) / peak) as usize
+            };
+            (0..USAGE_DAY_COUNT).map(move |row| {
+                if USAGE_DAY_COUNT - row <= height {
+                    4
+                } else {
+                    0
+                }
+            })
+        })
+        .collect()
+}
+
+fn daily_activity_glyph(level: usize) -> char {
     match level {
-        None => ' ',
-        Some(0) if daily => '·',
-        Some(0) => ' ',
-        Some(1) => '░',
-        Some(2) => '▒',
-        Some(3) => '▓',
-        Some(_) => '█',
+        0 => '□',
+        _ => '■',
     }
 }
 
 fn month_header(weeks: &[chrono::NaiveDate]) -> String {
     use chrono::Datelike;
 
-    let mut line = "    ".to_string();
-    let mut previous_month = None;
-    for week in weeks {
-        line.push(' ');
-        if previous_month != Some(week.month()) {
-            line.push_str(month_abbrev(week.month()));
-            previous_month = Some(week.month());
-        } else {
-            line.push(' ');
+    let mut cells = vec![' '; USAGE_WEEK_COUNT * 2 - 1];
+    let mut last_end = 0;
+    for (column, week) in weeks.iter().enumerate() {
+        if week.day() > 7 {
+            continue;
         }
+        let label = month_abbrev(week.month());
+        let offset = column * 2;
+        if offset < last_end || offset + label.len() > cells.len() {
+            continue;
+        }
+        for (index, ch) in label.chars().enumerate() {
+            cells[offset + index] = ch;
+        }
+        last_end = offset + label.len() + 1;
     }
-    line
+    format!("    {}", cells.into_iter().collect::<String>())
+}
+
+fn weekday_or_axis_label(view: UsageView, row: usize) -> &'static str {
+    if view != UsageView::Daily {
+        return match row {
+            0 => "max ",
+            6 => "  0 ",
+            _ => "    ",
+        };
+    }
+    match row {
+        0 => " Su ",
+        1 => " Mo ",
+        2 => " Tu ",
+        3 => " We ",
+        4 => " Th ",
+        5 => " Fr ",
+        6 => " Sa ",
+        _ => "    ",
+    }
+}
+
+fn bar_caption(view: UsageView, totals: &[i64]) -> String {
+    let (lead, peak) = match view {
+        UsageView::Weekly => (
+            "Each column = 1 week · tallest ",
+            totals.iter().copied().max().unwrap_or(0),
+        ),
+        UsageView::Cumulative => ("Running total · top ", totals.last().copied().unwrap_or(0)),
+        UsageView::Daily => unreachable!(),
+    };
+    if peak <= 0 {
+        "   No token activity in the last 12 months".to_string()
+    } else {
+        format!("   {lead}{}", format_tokens_compact(peak))
+    }
 }
 
 fn month_abbrev(month: u32) -> &'static str {
@@ -2094,14 +2170,35 @@ mod tests {
 
         let daily = token_activity_lines(UsageView::Daily, &buckets, today);
         assert!(daily[0].contains("Jun"));
-        assert_eq!(daily.len(), 9);
+        assert_eq!(daily.len(), 11);
         assert!(daily.iter().any(|line| line.starts_with(" Su")));
-        assert!(daily.iter().any(|line| line.contains('█')));
+        assert!(daily.iter().any(|line| line.contains('■')));
+        assert!(
+            daily
+                .iter()
+                .any(|line| line.contains("Less □ ■ ■ ■ ■ More"))
+        );
+        assert_eq!(
+            daily.last().map(String::as_str),
+            Some("   daily · weekly · cumulative")
+        );
 
         let weekly = token_activity_lines(UsageView::Weekly, &buckets, today);
-        assert_eq!(weekly.len(), 3);
-        assert!(weekly[2].contains("Weekly total"));
-        assert!(weekly[2].contains("30"));
+        assert_eq!(weekly.len(), 11);
+        assert!(weekly.iter().any(|line| line.starts_with("max ")));
+        assert!(weekly.iter().any(|line| line.starts_with("  0 ")));
+        assert!(
+            weekly
+                .iter()
+                .any(|line| line.contains("Each column = 1 week · tallest 30"))
+        );
+
+        let cumulative = token_activity_lines(UsageView::Cumulative, &buckets, today);
+        assert!(
+            cumulative
+                .iter()
+                .any(|line| line.contains("Running total · top 30"))
+        );
     }
 
     #[test]

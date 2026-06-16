@@ -62,9 +62,11 @@ Exit codes:
 - `1`: threshold reached, or rate-limit status is unavailable
 
 For token activity, use `daily`, `weekly`, or `cumulative`; `day` and `week`
-are accepted aliases. `cxst usage --json` prints a status object with
-`summary` and `dailyUsageBuckets`. It exits successfully even when the backend
-usage profile is unavailable, and reports `status: "unavailable"` plus a short
+are accepted aliases. Human output renders a TUI-style 52-week activity chart:
+daily is a calendar heatmap, while weekly and cumulative are 7-row bar charts
+with scale captions. `cxst usage --json` prints a status object with `summary`
+and `dailyUsageBuckets`. It exits successfully even when the backend usage
+profile is unavailable, and reports `status: "unavailable"` plus a short
 `reason`.
 
 For automation, combine `--json` with the same check or wait options. Check and
