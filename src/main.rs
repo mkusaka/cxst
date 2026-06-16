@@ -11,6 +11,9 @@ use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
 use codex_backend_client::Client as BackendClient;
+use codex_backend_client::TokenUsageProfile;
+use codex_backend_client::TokenUsageProfileDailyBucket;
+use codex_backend_client::TokenUsageProfileStats;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -51,6 +54,8 @@ struct Cli {
 enum Command {
     #[command(about = "Show Codex account and rate-limit status.")]
     Status,
+    #[command(about = "Show Codex account token activity.")]
+    Usage(UsageArgs),
     #[command(
         about = "Check whether selected rate-limit remaining usage is above a threshold.",
         after_long_help = "Exit codes:\n  0  selected rate limits are above the threshold\n  1  threshold reached, or rate-limit status is unavailable"
@@ -103,6 +108,26 @@ struct WaitArgs {
         help = "Stop successfully if the threshold is not reached before this duration."
     )]
     timeout: Option<Duration>,
+}
+
+#[derive(Debug, Args)]
+struct UsageArgs {
+    #[arg(
+        default_value = "daily",
+        value_enum,
+        help = "Token activity view to render."
+    )]
+    view: UsageView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum UsageView {
+    #[value(alias = "day")]
+    Daily,
+    #[value(alias = "week")]
+    Weekly,
+    Cumulative,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -170,6 +195,40 @@ struct RateLimitOutput {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct UsageOutput {
+    status: UsageStatus,
+    reason: Option<String>,
+    view: UsageView,
+    summary: Option<UsageSummaryOutput>,
+    daily_usage_buckets: Option<Vec<UsageDailyBucketOutput>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UsageStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageSummaryOutput {
+    lifetime_tokens: Option<i64>,
+    peak_daily_tokens: Option<i64>,
+    longest_running_turn_sec: Option<i64>,
+    current_streak_days: Option<i64>,
+    longest_streak_days: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageDailyBucketOutput {
+    start_date: String,
+    tokens: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RateLimitWindowOutput {
     remaining_percent: f64,
     used_percent: f64,
@@ -231,6 +290,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Command::Usage(args)) => run_usage(&cli, args).await,
         Some(Command::Check(args)) => run_check(&cli, args).await,
         Some(Command::Wait(args)) => run_wait(&cli, args).await,
         Some(Command::Status) | None => {
@@ -245,18 +305,22 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
 }
 
-async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
+async fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     let cli_overrides = cli
         .config_overrides
         .parse_overrides()
         .map_err(|error| anyhow::anyhow!("failed to parse -c/--config override: {error}"))?;
-    let config = ConfigBuilder::default()
+    ConfigBuilder::default()
         .cli_overrides(cli_overrides)
         .harness_overrides(ConfigOverrides::default())
         .strict_config(false)
         .build()
         .await
-        .context("failed to load Codex config")?;
+        .context("failed to load Codex config")
+}
+
+async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
+    let config = load_config(cli).await?;
 
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
@@ -284,6 +348,25 @@ async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
         rate_limits,
         codex,
     })
+}
+
+async fn run_usage(cli: &Cli, args: &UsageArgs) -> anyhow::Result<ExitCode> {
+    let output = load_usage(cli, args.view).await?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print_usage_human(&output);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn load_usage(cli: &Cli, view: UsageView) -> anyhow::Result<UsageOutput> {
+    let config = load_config(cli).await?;
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
+    let auth = auth_manager.auth().await;
+
+    Ok(load_token_usage(&config.chatgpt_base_url, auth.as_ref(), view).await)
 }
 
 async fn run_check(cli: &Cli, args: &CheckArgs) -> anyhow::Result<ExitCode> {
@@ -589,6 +672,87 @@ async fn load_rate_limits(base_url: &str, auth: Option<&CodexAuth>) -> RateLimit
         },
         Err(err) => unavailable(rate_limit_error_reason(&err)),
     }
+}
+
+async fn load_token_usage(
+    base_url: &str,
+    auth: Option<&CodexAuth>,
+    view: UsageView,
+) -> UsageOutput {
+    let Some(auth) = auth else {
+        return usage_unavailable(
+            view,
+            "codex account authentication required to read token usage",
+        );
+    };
+
+    if !auth.uses_codex_backend() {
+        return usage_unavailable(view, "chatgpt authentication required to read token usage");
+    }
+
+    let client = match BackendClient::from_auth(base_url.to_string(), auth) {
+        Ok(client) => client,
+        Err(_) => return usage_unavailable(view, "failed to construct backend client"),
+    };
+
+    match client.get_token_usage_profile().await {
+        Ok(profile) => normalize_token_usage(profile, view),
+        Err(err) => usage_unavailable(view, token_usage_error_reason(&err)),
+    }
+}
+
+fn usage_unavailable(view: UsageView, reason: impl Into<String>) -> UsageOutput {
+    UsageOutput {
+        status: UsageStatus::Unavailable,
+        reason: Some(reason.into()),
+        view,
+        summary: None,
+        daily_usage_buckets: None,
+    }
+}
+
+fn token_usage_error_reason(err: &anyhow::Error) -> &'static str {
+    let message = err.to_string();
+    if message.contains("401") || message.contains("Unauthorized") {
+        "authentication failed while reading token usage"
+    } else {
+        "failed to fetch token usage"
+    }
+}
+
+fn normalize_token_usage(profile: TokenUsageProfile, view: UsageView) -> UsageOutput {
+    let stats = profile.stats;
+    UsageOutput {
+        status: UsageStatus::Available,
+        reason: None,
+        view,
+        summary: Some(usage_summary_output(&stats)),
+        daily_usage_buckets: stats.daily_usage_buckets.map(normalize_usage_daily_buckets),
+    }
+}
+
+fn usage_summary_output(stats: &TokenUsageProfileStats) -> UsageSummaryOutput {
+    UsageSummaryOutput {
+        lifetime_tokens: stats.lifetime_tokens,
+        peak_daily_tokens: stats.peak_daily_tokens,
+        longest_running_turn_sec: stats.longest_running_turn_sec,
+        current_streak_days: stats.current_streak_days,
+        longest_streak_days: stats.longest_streak_days,
+    }
+}
+
+fn normalize_usage_daily_buckets(
+    buckets: Vec<TokenUsageProfileDailyBucket>,
+) -> Vec<UsageDailyBucketOutput> {
+    let mut buckets = buckets
+        .into_iter()
+        .map(|bucket| UsageDailyBucketOutput {
+            start_date: bucket.start_date,
+            tokens: bucket.tokens,
+        })
+        .collect::<Vec<_>>();
+    buckets.sort_by(|left, right| left.start_date.cmp(&right.start_date));
+    buckets
 }
 
 fn unavailable(reason: impl Into<String>) -> RateLimitsOutput {
@@ -1011,6 +1175,33 @@ fn print_human(output: &StatusOutput) {
     }
 }
 
+fn print_usage_human(output: &UsageOutput) {
+    println!("Token activity   last 12 months");
+    match output.status {
+        UsageStatus::Unavailable => {
+            let reason = output.reason.as_deref().unwrap_or("unavailable");
+            println!("  unavailable     {reason}");
+        }
+        UsageStatus::Available => {
+            if let Some(summary) = &output.summary {
+                println!("  {}", usage_summary_line(summary));
+            }
+            match output.daily_usage_buckets.as_deref() {
+                Some(buckets) => {
+                    for line in token_activity_lines(
+                        output.view,
+                        buckets,
+                        chrono::Local::now().date_naive(),
+                    ) {
+                        println!("{line}");
+                    }
+                }
+                None => println!("  Token activity history unavailable"),
+            }
+        }
+    }
+}
+
 fn limit_has_displayable_window(limit: &RateLimitOutput) -> bool {
     limit.five_hour.is_some() || limit.weekly.is_some() || limit.monthly.is_some()
 }
@@ -1235,6 +1426,252 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn usage_summary_line(summary: &UsageSummaryOutput) -> String {
+    let streak = match (summary.current_streak_days, summary.longest_streak_days) {
+        (Some(current), Some(best)) => format!("{current}d (best {best}d)"),
+        (Some(current), None) => format!("{current}d"),
+        (None, Some(best)) => format!("- (best {best}d)"),
+        (None, None) => "-".to_string(),
+    };
+    format!(
+        "Lifetime {} · Peak {} · Streak {} · Longest task {}",
+        format_optional_tokens(summary.lifetime_tokens),
+        format_optional_tokens(summary.peak_daily_tokens),
+        streak,
+        format_optional_seconds(summary.longest_running_turn_sec)
+    )
+}
+
+fn token_activity_lines(
+    view: UsageView,
+    buckets: &[UsageDailyBucketOutput],
+    today: chrono::NaiveDate,
+) -> Vec<String> {
+    let weeks = activity_weeks(today);
+    let values = activity_values(buckets, &weeks, today);
+    match view {
+        UsageView::Daily => daily_activity_lines(&weeks, &values),
+        UsageView::Weekly | UsageView::Cumulative => {
+            aggregate_activity_lines(view, &weeks, &values)
+        }
+    }
+}
+
+fn activity_weeks(today: chrono::NaiveDate) -> Vec<chrono::NaiveDate> {
+    use chrono::Datelike;
+
+    let days_until_saturday = 6_i64 - i64::from(today.weekday().num_days_from_sunday());
+    let end = today + chrono::Duration::days(days_until_saturday);
+    let start = end - chrono::Duration::days((52 * 7 - 1) as i64);
+    (0..52)
+        .map(|week| start + chrono::Duration::days((week * 7) as i64))
+        .collect()
+}
+
+fn activity_values(
+    buckets: &[UsageDailyBucketOutput],
+    weeks: &[chrono::NaiveDate],
+    today: chrono::NaiveDate,
+) -> Vec<Option<i64>> {
+    let by_date = buckets
+        .iter()
+        .filter_map(|bucket| {
+            let date = chrono::NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok()?;
+            Some((date, bucket.tokens.max(0)))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    weeks
+        .iter()
+        .flat_map(|week_start| {
+            (0..7).map(|day| {
+                let date = *week_start + chrono::Duration::days(day);
+                if date > today {
+                    None
+                } else {
+                    Some(*by_date.get(&date).unwrap_or(&0))
+                }
+            })
+        })
+        .collect()
+}
+
+fn daily_activity_lines(weeks: &[chrono::NaiveDate], values: &[Option<i64>]) -> Vec<String> {
+    let levels = activity_levels(values);
+    let mut lines = vec![month_header(weeks)];
+    for row in 0..7 {
+        let mut line = format!(" {:<2}", weekday_abbrev(row));
+        for column in 0..52 {
+            let index = column * 7 + row;
+            line.push(' ');
+            line.push(activity_glyph(levels[index], true));
+        }
+        lines.push(line);
+    }
+    lines.push("     · none  ░ low  ▒ medium  ▓ high  █ peak".to_string());
+    lines
+}
+
+fn aggregate_activity_lines(
+    view: UsageView,
+    weeks: &[chrono::NaiveDate],
+    values: &[Option<i64>],
+) -> Vec<String> {
+    let mut totals = weekly_totals(values);
+    if view == UsageView::Cumulative {
+        let mut running = 0;
+        for total in &mut totals {
+            running += *total;
+            *total = running;
+        }
+    }
+    let levels = activity_levels(&totals.iter().copied().map(Some).collect::<Vec<_>>());
+    let mut line = "     ".to_string();
+    for level in levels {
+        line.push(' ');
+        line.push(activity_glyph(level, false));
+    }
+    let label = match view {
+        UsageView::Weekly => "Weekly total",
+        UsageView::Cumulative => "Running total",
+        UsageView::Daily => unreachable!(),
+    };
+    let peak = totals.iter().copied().max().unwrap_or(0);
+    vec![
+        month_header(weeks),
+        line,
+        format!("     {label} · top {}", format_tokens_compact(peak)),
+    ]
+}
+
+fn weekly_totals(values: &[Option<i64>]) -> Vec<i64> {
+    values
+        .chunks(7)
+        .map(|week| week.iter().flatten().sum::<i64>())
+        .collect()
+}
+
+fn activity_levels(values: &[Option<i64>]) -> Vec<Option<usize>> {
+    let peak = values.iter().flatten().copied().max().unwrap_or(0);
+    values
+        .iter()
+        .map(|value| {
+            let value = (*value)?;
+            if value == 0 || peak == 0 {
+                Some(0)
+            } else {
+                Some(((value as f64 / peak as f64) * 4.0).ceil() as usize)
+            }
+        })
+        .collect()
+}
+
+fn activity_glyph(level: Option<usize>, daily: bool) -> char {
+    match level {
+        None => ' ',
+        Some(0) if daily => '·',
+        Some(0) => ' ',
+        Some(1) => '░',
+        Some(2) => '▒',
+        Some(3) => '▓',
+        Some(_) => '█',
+    }
+}
+
+fn month_header(weeks: &[chrono::NaiveDate]) -> String {
+    use chrono::Datelike;
+
+    let mut line = "    ".to_string();
+    let mut previous_month = None;
+    for week in weeks {
+        line.push(' ');
+        if previous_month != Some(week.month()) {
+            line.push_str(month_abbrev(week.month()));
+            previous_month = Some(week.month());
+        } else {
+            line.push(' ');
+        }
+    }
+    line
+}
+
+fn month_abbrev(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "",
+    }
+}
+
+fn weekday_abbrev(row: usize) -> &'static str {
+    match row {
+        0 => "Su",
+        1 => "Mo",
+        2 => "Tu",
+        3 => "We",
+        4 => "Th",
+        5 => "Fr",
+        6 => "Sa",
+        _ => "",
+    }
+}
+
+fn format_optional_tokens(value: Option<i64>) -> String {
+    value
+        .map(format_tokens_compact)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_tokens_compact(value: i64) -> String {
+    let value = value.max(0);
+    if value >= 1_000_000_000 {
+        format_compact_number(value, 1_000_000_000, "B")
+    } else if value >= 1_000_000 {
+        format_compact_number(value, 1_000_000, "M")
+    } else if value >= 1_000 {
+        format_compact_number(value, 1_000, "K")
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_compact_number(value: i64, divisor: i64, suffix: &str) -> String {
+    let scaled = value as f64 / divisor as f64;
+    if scaled >= 100.0 || (scaled.fract() - 0.0).abs() < f64::EPSILON {
+        format!("{scaled:.0}{suffix}")
+    } else {
+        format!("{scaled:.1}{suffix}")
+    }
+}
+
+fn format_optional_seconds(value: Option<i64>) -> String {
+    let Some(value) = value else {
+        return "-".to_string();
+    };
+    let seconds = value.max(0);
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if hours > 0 && minutes > 0 {
+        format!("{hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn percent_bar(percent: f64) -> String {
     let width = 20;
     let filled = ((percent.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
@@ -1287,6 +1724,28 @@ mod tests {
         }
     }
 
+    fn token_usage_profile() -> TokenUsageProfile {
+        TokenUsageProfile {
+            stats: TokenUsageProfileStats {
+                lifetime_tokens: Some(19_100_000_000),
+                peak_daily_tokens: Some(912_000_000),
+                longest_running_turn_sec: Some(42_240),
+                current_streak_days: Some(1),
+                longest_streak_days: Some(38),
+                daily_usage_buckets: Some(vec![
+                    TokenUsageProfileDailyBucket {
+                        start_date: "2026-06-15".to_string(),
+                        tokens: 12_000,
+                    },
+                    TokenUsageProfileDailyBucket {
+                        start_date: "2026-06-14".to_string(),
+                        tokens: 24_000,
+                    },
+                ]),
+            },
+        }
+    }
+
     #[test]
     fn normalizes_default_limit_id_and_remaining_percentages() {
         let limits = normalize_rate_limits(vec![snapshot(None, Some(25.0), Some(40.0))]);
@@ -1326,6 +1785,25 @@ mod tests {
             output.reason.as_deref(),
             Some("chatgpt authentication required")
         );
+    }
+
+    #[test]
+    fn usage_unavailable_has_fixed_reason_without_payload() {
+        let output = usage_unavailable(
+            UsageView::Daily,
+            "chatgpt authentication required to read token usage",
+        );
+        let json = serde_json::to_string(&output).unwrap();
+
+        assert!(matches!(output.status, UsageStatus::Unavailable));
+        assert_eq!(
+            output.reason.as_deref(),
+            Some("chatgpt authentication required to read token usage")
+        );
+        assert!(output.summary.is_none());
+        assert!(output.daily_usage_buckets.is_none());
+        assert!(!json.contains("Authorization"));
+        assert!(!json.contains("github_pat_"));
     }
 
     #[test]
@@ -1518,6 +1996,112 @@ mod tests {
             }
             other => panic!("expected check command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_usage_command_default_and_aliases() {
+        let cli = Cli::try_parse_from(["cxst", "usage"]).unwrap();
+        match cli.command {
+            Some(Command::Usage(args)) => assert_eq!(args.view, UsageView::Daily),
+            other => panic!("expected usage command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["cxst", "usage", "week"]).unwrap();
+        match cli.command {
+            Some(Command::Usage(args)) => assert_eq!(args.view, UsageView::Weekly),
+            other => panic!("expected usage command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["cxst", "--json", "usage", "cumulative"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Some(Command::Usage(args)) => assert_eq!(args.view, UsageView::Cumulative),
+            other => panic!("expected usage command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalizes_token_usage_profile_for_json() {
+        let output = normalize_token_usage(token_usage_profile(), UsageView::Daily);
+        let json = serde_json::to_value(&output).unwrap();
+
+        assert_eq!(json["status"], "available");
+        assert_eq!(json["reason"], serde_json::Value::Null);
+        assert_eq!(json["view"], "daily");
+        assert_eq!(json["summary"]["lifetimeTokens"], 19_100_000_000_i64);
+        assert_eq!(json["summary"]["peakDailyTokens"], 912_000_000_i64);
+        assert_eq!(json["summary"]["longestRunningTurnSec"], 42_240);
+        assert_eq!(json["summary"]["currentStreakDays"], 1);
+        assert_eq!(json["summary"]["longestStreakDays"], 38);
+        assert_eq!(json["dailyUsageBuckets"][0]["startDate"], "2026-06-14");
+        assert_eq!(json["dailyUsageBuckets"][0]["tokens"], 24_000);
+        assert_eq!(json["dailyUsageBuckets"][1]["startDate"], "2026-06-15");
+        assert_eq!(json["dailyUsageBuckets"][1]["tokens"], 12_000);
+        assert!(json.get("auth").is_none());
+        assert!(json.get("codex").is_none());
+    }
+
+    #[test]
+    fn token_usage_history_can_be_missing() {
+        let profile = TokenUsageProfile {
+            stats: TokenUsageProfileStats {
+                lifetime_tokens: None,
+                peak_daily_tokens: None,
+                longest_running_turn_sec: None,
+                current_streak_days: None,
+                longest_streak_days: None,
+                daily_usage_buckets: None,
+            },
+        };
+
+        let output = normalize_token_usage(profile, UsageView::Weekly);
+
+        assert!(matches!(output.status, UsageStatus::Available));
+        assert!(output.daily_usage_buckets.is_none());
+        assert_eq!(
+            usage_summary_line(output.summary.as_ref().unwrap()),
+            "Lifetime - · Peak - · Streak - · Longest task -"
+        );
+    }
+
+    #[test]
+    fn formats_usage_summary_and_duration() {
+        let summary = usage_summary_output(&token_usage_profile().stats);
+
+        assert_eq!(
+            usage_summary_line(&summary),
+            "Lifetime 19.1B · Peak 912M · Streak 1d (best 38d) · Longest task 11h 44m"
+        );
+        assert_eq!(format_optional_seconds(Some(59)), "59s");
+        assert_eq!(format_optional_seconds(Some(60)), "1m");
+        assert_eq!(format_optional_seconds(Some(3_600)), "1h");
+        assert_eq!(format_tokens_compact(1_500), "1.5K");
+    }
+
+    #[test]
+    fn renders_daily_and_weekly_usage_lines() {
+        let buckets = vec![
+            UsageDailyBucketOutput {
+                start_date: "2026-06-14".to_string(),
+                tokens: 10,
+            },
+            UsageDailyBucketOutput {
+                start_date: "2026-06-15".to_string(),
+                tokens: 20,
+            },
+        ];
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 16).unwrap();
+
+        let daily = token_activity_lines(UsageView::Daily, &buckets, today);
+        assert!(daily[0].contains("Jun"));
+        assert_eq!(daily.len(), 9);
+        assert!(daily.iter().any(|line| line.starts_with(" Su")));
+        assert!(daily.iter().any(|line| line.contains('█')));
+
+        let weekly = token_activity_lines(UsageView::Weekly, &buckets, today);
+        assert_eq!(weekly.len(), 3);
+        assert!(weekly[2].contains("Weekly total"));
+        assert!(weekly[2].contains("30"));
     }
 
     #[test]

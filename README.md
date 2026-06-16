@@ -1,18 +1,21 @@
 # cxst
 
-`cxst` shows safe Codex account and rate-limit status without opening the
+`cxst` shows safe Codex account, rate-limit, and token-activity status without opening the
 Codex TUI.
 
 It mirrors the TUI `/status` rate-limit source by using Codex auth/config and
-the Codex backend rate-limit snapshot. It intentionally does not show tokens,
-refresh tokens, API keys, account IDs, raw limit IDs, or thread-specific TUI
-state.
+the Codex backend rate-limit snapshot. It can also read the same account token
+activity source used by TUI `/usage`. It intentionally does not show auth
+tokens, refresh tokens, API keys, account IDs, raw limit IDs, raw backend
+responses, or thread-specific TUI state.
 
 ## Usage
 
 ```sh
 cxst
 cxst --json
+cxst usage daily
+cxst usage weekly --json
 cxst check --remaining-percent 10 --window both
 cxst wait --remaining-percent 10 --window both --interval 60s
 cxst -c model=gpt-5.5
@@ -39,6 +42,29 @@ Rate limits
 `--json` prints machine-readable JSON with the same core fields plus raw
 timestamps and window metadata when available.
 
+`cxst usage [daily|weekly|cumulative]` prints account token activity for the
+last 12 months. Human output includes the lifetime, peak daily usage, streak,
+longest task duration, and a compact activity chart. `cxst usage --json` prints
+the same summary plus `dailyUsageBuckets` with synthetic-safe field names:
+
+```json
+{
+  "status": "available",
+  "reason": null,
+  "view": "daily",
+  "summary": {
+    "lifetimeTokens": 19100000000,
+    "peakDailyTokens": 912000000,
+    "longestRunningTurnSec": 42240,
+    "currentStreakDays": 1,
+    "longestStreakDays": 38
+  },
+  "dailyUsageBuckets": [
+    { "startDate": "2026-06-16", "tokens": 12345 }
+  ]
+}
+```
+
 `cxst check` is a one-shot preflight for automation. It exits `0` when all
 selected rate-limit windows are above the threshold, and exits `1` when any
 selected window is at or below the threshold or rate-limit status is
@@ -61,16 +87,21 @@ Included:
   home, collaboration mode, and configured instruction source paths
 - 5-hour, weekly, and monthly remaining percentages from the rate-limit snapshot
 - reset timestamps and window length when returned by the backend
+- account-level token activity summary and daily usage buckets from `/usage`
 
 Not included:
 
-- current TUI thread name/id, fork metadata, or context/token usage
+- current TUI thread name/id, fork metadata, or per-thread context/token usage
 - raw backend token values, account IDs, API keys, or raw per-limit identifiers
 - automatic watch mode
 
 When rate limits cannot be read, `cxst` prints a short unavailable reason. API
 key auth is expected to be unavailable for rate-limit reads because Codex
 backend rate limits require ChatGPT/Codex backend auth.
+
+When token activity cannot be read, `cxst usage` prints a short unavailable
+reason. API key auth is expected to be unavailable for usage reads because the
+Codex backend profile requires ChatGPT/Codex backend auth.
 
 ## Development
 

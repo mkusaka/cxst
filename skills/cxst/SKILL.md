@@ -1,13 +1,13 @@
 ---
 name: cxst
-description: Use when Codex needs to inspect local Codex account status, active configuration, or 5-hour/weekly/monthly rate-limit remaining usage with the cxst CLI instead of opening the Codex TUI. Trigger for requests to check Codex status, remaining usage, rate limits, active model/provider, auth state, Codex home, permissions, JSON status output, preflight-check remaining usage, or wait until remaining rate-limit usage reaches a threshold.
+description: Use when Codex needs to inspect local Codex account status, active configuration, account token activity, or 5-hour/weekly/monthly rate-limit remaining usage with the cxst CLI instead of opening the Codex TUI. Trigger for requests to check Codex status, `/usage` token activity, remaining usage, rate limits, active model/provider, auth state, Codex home, permissions, JSON status output, preflight-check remaining usage, or wait until remaining rate-limit usage reaches a threshold.
 ---
 
 # cxst Status
 
-Use `cxst` to inspect local Codex status from a shell. Prefer it when the user
-wants a quick status snapshot or machine-readable status without opening an
-interactive TUI.
+Use `cxst` to inspect local Codex status and account usage from a shell. Prefer
+it when the user wants a quick status snapshot, token activity, or
+machine-readable status without opening an interactive TUI.
 
 ## Commands
 
@@ -21,6 +21,14 @@ Machine-readable status:
 
 ```sh
 cxst --json
+```
+
+Account token activity from the same source as TUI `/usage`:
+
+```sh
+cxst usage daily
+cxst usage weekly --json
+cxst usage cumulative
 ```
 
 One-shot threshold check for automation preflight:
@@ -53,9 +61,16 @@ Exit codes:
 - `0`: timeout reached before the threshold was hit
 - `1`: threshold reached, or rate-limit status is unavailable
 
-For automation, combine `--json` with the same check or wait options. JSON
-events include `status`, `thresholdRemainingPercent`, selected `windows`,
-optional `reason`, and, for waiting events, optional `nextPollSeconds`.
+For token activity, use `daily`, `weekly`, or `cumulative`; `day` and `week`
+are accepted aliases. `cxst usage --json` prints a status object with
+`summary` and `dailyUsageBuckets`. It exits successfully even when the backend
+usage profile is unavailable, and reports `status: "unavailable"` plus a short
+`reason`.
+
+For automation, combine `--json` with the same check or wait options. Check and
+wait JSON events include `status`, `thresholdRemainingPercent`, selected
+`windows`, optional `reason`, and, for waiting events, optional
+`nextPollSeconds`.
 
 ## Alternate Codex Homes
 
@@ -82,6 +97,13 @@ Use the output fields as reported by `cxst`:
 - configured instruction source paths
 - 5-hour, weekly, and monthly rate-limit remaining percentages
 - reset timestamps or reset display times when available
+- account-level token activity summary and daily usage buckets from `/usage`
 
 If rate limits are unavailable, report the short reason from `cxst` and avoid
 speculating from lower-level auth or backend errors.
+
+If usage is unavailable, report the short reason from `cxst usage` and avoid
+printing raw backend errors. The `tokens` field in usage output is a usage
+count, not an auth token. Do not expose auth tokens, refresh tokens, API keys,
+account IDs, workspace/profile IDs, raw backend payloads, headers, cookies, or
+raw backend identifiers.

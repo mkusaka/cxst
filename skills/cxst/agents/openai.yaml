@@ -1,4 +1,4 @@
 interface:
   display_name: "cxst"
-  short_description: "Check local Codex status or rate-limit thresholds"
-  default_prompt: "Use cxst to inspect local Codex status, check rate-limit thresholds, or wait on remaining usage."
+  short_description: "Check local Codex status, usage, or rate-limit thresholds"
+  default_prompt: "Use cxst to inspect local Codex status, token activity, check rate-limit thresholds, or wait on remaining usage."
