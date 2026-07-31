@@ -78,7 +78,7 @@ jobs:
     permissions: {}
     env:
       # renovate: datasource=github-releases depName=zizmorcore/zizmor
-      ZIZMOR_VERSION: v1.27.0
+      ZIZMOR_VERSION: v1.28.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
