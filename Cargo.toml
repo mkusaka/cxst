@@ -13,14 +13,14 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive"] }
-codex-backend-client = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-backend-client" }
-codex-core = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-core" }
-codex-login = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-login" }
-codex-model-provider = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-model-provider" }
-codex-protocol = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-protocol" }
-codex-utils-absolute-path = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-utils-absolute-path" }
-codex-utils-cli = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-utils-cli" }
-codex-utils-sandbox-summary = { git = "https://github.com/mkusaka/codex", rev = "ebd948fce23387349b764d16ea0b54e97e677a62", package = "codex-utils-sandbox-summary" }
+codex-backend-client = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-backend-client" }
+codex-core = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-core" }
+codex-login = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-login" }
+codex-model-provider = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-model-provider" }
+codex-protocol = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-protocol" }
+codex-utils-absolute-path = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-utils-absolute-path" }
+codex-utils-cli = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-utils-cli" }
+codex-utils-sandbox-summary = { git = "https://github.com/mkusaka/codex", rev = "03bb3b12367397e14a8facc2e018d645ff4d8e83", package = "codex-utils-sandbox-summary" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

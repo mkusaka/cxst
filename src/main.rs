@@ -629,10 +629,10 @@ fn auth_output_from_account_state(
         Some(ProviderAccount::Chatgpt { email, plan_type }) => AuthOutput {
             status: AuthStatus::Chatgpt,
             requires_openai_auth,
-            email: Some(email.clone()),
+            email: email.clone(),
             plan_type: Some(plan_type_label(plan_type)),
         },
-        Some(ProviderAccount::AmazonBedrock) => AuthOutput {
+        Some(ProviderAccount::AmazonBedrock { .. }) => AuthOutput {
             status: AuthStatus::AmazonBedrock,
             requires_openai_auth,
             email: None,
@@ -1795,6 +1795,7 @@ mod tests {
             }),
             credits: None::<CreditsSnapshot>,
             individual_limit: None::<SpendControlLimitSnapshot>,
+            spend_control_reached: None,
             plan_type: Some(PlanType::Plus),
             rate_limit_reached_type: None,
         }
@@ -1916,7 +1917,7 @@ mod tests {
     #[test]
     fn auth_output_maps_chatgpt_with_email_like_status() {
         let account = ProviderAccount::Chatgpt {
-            email: "user@example.invalid".to_string(),
+            email: Some("user@example.invalid".to_string()),
             plan_type: PlanType::Pro,
         };
         let output = auth_output_from_account_state(Some(&account), true);
