@@ -9,6 +9,12 @@ activity source used by TUI `/usage`. It intentionally does not show auth
 tokens, refresh tokens, API keys, account IDs, raw limit IDs, raw backend
 responses, or thread-specific TUI state.
 
+## Install
+
+```sh
+brew install mkusaka/tap/cxst
+```
+
 ## Usage
 
 ```sh
