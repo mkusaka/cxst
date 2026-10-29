@@ -32,6 +32,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_utils_cli::CliConfigOverrides;
+use codex_utils_path_uri::PathUri;
 use codex_utils_sandbox_summary::summarize_permission_profile;
 use serde::Serialize;
 
@@ -167,6 +168,7 @@ enum AuthStatus {
     Chatgpt,
     ApiKey,
     AmazonBedrock,
+    Gcp,
     Unauthenticated,
     NotRequired,
     Unavailable,
@@ -327,7 +329,7 @@ async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
     let config = load_config(cli).await?;
 
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await?;
     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager.clone()));
 
     let auth = auth_manager.auth().await;
@@ -344,7 +346,7 @@ async fn load_status(cli: &Cli) -> anyhow::Result<StatusOutput> {
         },
     };
 
-    let rate_limits = load_rate_limits(&config.chatgpt_base_url, auth.as_ref()).await;
+    let rate_limits = load_rate_limits(&config, auth.as_ref()).await;
     let codex = codex_output_from_config(&config);
 
     Ok(StatusOutput {
@@ -367,10 +369,10 @@ async fn run_usage(cli: &Cli, args: &UsageArgs) -> anyhow::Result<ExitCode> {
 async fn load_usage(cli: &Cli, view: UsageView) -> anyhow::Result<UsageOutput> {
     let config = load_config(cli).await?;
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await?;
     let auth = auth_manager.auth().await;
 
-    Ok(load_token_usage(&config.chatgpt_base_url, auth.as_ref(), view).await)
+    Ok(load_token_usage(&config, auth.as_ref(), view).await)
 }
 
 async fn run_check(cli: &Cli, args: &CheckArgs) -> anyhow::Result<ExitCode> {
@@ -638,6 +640,12 @@ fn auth_output_from_account_state(
             email: None,
             plan_type: None,
         },
+        Some(ProviderAccount::Gcp) => AuthOutput {
+            status: AuthStatus::Gcp,
+            requires_openai_auth,
+            email: None,
+            plan_type: None,
+        },
         None if requires_openai_auth => AuthOutput {
             status: AuthStatus::Unauthenticated,
             requires_openai_auth,
@@ -653,7 +661,7 @@ fn auth_output_from_account_state(
     }
 }
 
-async fn load_rate_limits(base_url: &str, auth: Option<&CodexAuth>) -> RateLimitsOutput {
+async fn load_rate_limits(config: &Config, auth: Option<&CodexAuth>) -> RateLimitsOutput {
     let Some(auth) = auth else {
         return unavailable("codex account authentication required");
     };
@@ -662,10 +670,11 @@ async fn load_rate_limits(base_url: &str, auth: Option<&CodexAuth>) -> RateLimit
         return unavailable("chatgpt authentication required");
     }
 
-    let client = match BackendClient::from_auth(base_url.to_string(), auth) {
-        Ok(client) => client,
-        Err(_) => return unavailable("failed to construct backend client"),
-    };
+    let client = BackendClient::from_auth(
+        config.chatgpt_base_url.clone(),
+        auth,
+        config.http_client_factory(),
+    );
 
     match client.get_rate_limits_many().await {
         Ok(snapshots) if snapshots.is_empty() => unavailable("no rate limit snapshots returned"),
@@ -679,7 +688,7 @@ async fn load_rate_limits(base_url: &str, auth: Option<&CodexAuth>) -> RateLimit
 }
 
 async fn load_token_usage(
-    base_url: &str,
+    config: &Config,
     auth: Option<&CodexAuth>,
     view: UsageView,
 ) -> UsageOutput {
@@ -694,10 +703,11 @@ async fn load_token_usage(
         return usage_unavailable(view, "chatgpt authentication required to read token usage");
     }
 
-    let client = match BackendClient::from_auth(base_url.to_string(), auth) {
-        Ok(client) => client,
-        Err(_) => return usage_unavailable(view, "failed to construct backend client"),
-    };
+    let client = BackendClient::from_auth(
+        config.chatgpt_base_url.clone(),
+        auth,
+        config.http_client_factory(),
+    );
 
     match client.get_token_usage_profile().await {
         Ok(profile) => normalize_token_usage(profile, view),
@@ -919,8 +929,9 @@ fn permissions_label(config: &Config) -> String {
         &approval_policy.to_string(),
     );
     let workspace_roots = config.effective_workspace_roots();
-    let sandbox = status_permission_summary(&permission_profile, config, &workspace_roots);
-    let workspace_root_suffix = workspace_root_suffix(&workspace_roots, config.cwd.as_path());
+    let cwd = PathUri::from_abs_path(&config.cwd);
+    let sandbox = status_permission_summary(&permission_profile, &cwd, &workspace_roots);
+    let workspace_root_suffix = workspace_root_suffix(&workspace_roots, &cwd);
 
     status_permissions_label(
         active_permission_profile.as_ref(),
@@ -934,10 +945,10 @@ fn permissions_label(config: &Config) -> String {
 
 fn status_permission_summary(
     permission_profile: &PermissionProfile,
-    config: &Config,
-    workspace_roots: &[codex_utils_absolute_path::AbsolutePathBuf],
+    cwd: &PathUri,
+    workspace_roots: &[PathUri],
 ) -> String {
-    let summary = summarize_permission_profile(permission_profile, &config.cwd, workspace_roots);
+    let summary = summarize_permission_profile(permission_profile, cwd, workspace_roots);
     if let Some(details) = summary.strip_prefix("read-only") {
         if details.contains("(network access enabled)") {
             return "read-only with network access".to_string();
@@ -956,14 +967,11 @@ fn status_permission_summary(
     summary
 }
 
-fn workspace_root_suffix(
-    workspace_roots: &[codex_utils_absolute_path::AbsolutePathBuf],
-    cwd: &Path,
-) -> Option<String> {
+fn workspace_root_suffix(workspace_roots: &[PathUri], cwd: &PathUri) -> Option<String> {
     let extra_roots = workspace_roots
         .iter()
-        .filter(|root| root.as_path() != cwd)
-        .map(|root| root.to_string_lossy().to_string())
+        .filter(|root| root.to_string() != cwd.to_string())
+        .map(PathUri::inferred_native_path_string)
         .collect::<Vec<_>>();
     if extra_roots.is_empty() {
         None
@@ -1122,12 +1130,20 @@ fn plan_type_label(plan_type: &PlanType) -> String {
         PlanType::Plus => "plus",
         PlanType::Pro => "pro",
         PlanType::ProLite => "pro_lite",
+        PlanType::ProMax => "pro_max",
         PlanType::Team => "team",
+        PlanType::SelfServeBusinessProLite => "self_serve_business_prolite",
         PlanType::SelfServeBusinessUsageBased => "self_serve_business_usage_based",
         PlanType::Business => "business",
+        PlanType::Ent26 => "ent26",
+        PlanType::EnterpriseCbpAutomation => "enterprise_cbp_automation",
         PlanType::EnterpriseCbpUsageBased => "enterprise_cbp_usage_based",
         PlanType::Enterprise => "enterprise",
         PlanType::Edu => "edu",
+        PlanType::EduPlus => "edu_plus",
+        PlanType::EduPro => "edu_pro",
+        PlanType::Sci => "sci",
+        PlanType::SciPlus => "sci_plus",
         PlanType::Unknown => "unknown",
     }
     .to_string()
@@ -1232,6 +1248,7 @@ fn auth_status_label(auth: &AuthOutput) -> String {
         AuthStatus::Chatgpt => "ChatGPT",
         AuthStatus::ApiKey => "API key",
         AuthStatus::AmazonBedrock => "Amazon Bedrock",
+        AuthStatus::Gcp => "GCP",
         AuthStatus::Unauthenticated => "unauthenticated",
         AuthStatus::NotRequired => "not required",
         AuthStatus::Unavailable => "unavailable",
@@ -1783,6 +1800,7 @@ mod tests {
         RateLimitSnapshot {
             limit_id: limit_id.map(str::to_string),
             limit_name: None,
+            normal_model_slug: None,
             primary: primary.map(|used_percent| RateLimitWindow {
                 used_percent,
                 window_minutes: primary_window_minutes,
