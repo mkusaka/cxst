@@ -7,6 +7,12 @@ on:
 
 permissions: {}
 
+# The "-caller" suffix keeps this group distinct from ci.yml's, which is built
+# from the caller's github.workflow when called as a reusable workflow.
+concurrency:
+  group: ${{ github.workflow }}-caller-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   verify:
     name: CI
